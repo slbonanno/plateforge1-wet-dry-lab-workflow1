@@ -1,0 +1,24 @@
+{
+  "_comment": "Example experiment definition. Schema lives at config/experiment.schema.json once written.",
+  "name": "monoclonal ELISA, campaign A",
+  "plate_format": 96,
+  "replicates": 1,
+  "layout": {
+    "fill_order": "column",
+    "reserved_wells": ["A01", "H12"]
+  },
+  "controls": {
+    "resolver": "mirrored_plate",
+    "control_role": "fc"
+  },
+  "hit_calling": {
+    "strategy": "fold_over_control",
+    "threshold": 3.0
+  },
+  "reagents": {
+    "primary": null,
+    "secondary": null,
+    "substrate": null
+  },
+  "notes": ""
+}
