@@ -128,3 +128,9 @@ def test_supersession(tmp_path, monkeypatch):
     assert not artifacts.is_superseded(second)
     assert [a.obj_id for a in artifacts.current("analysis")] == [second]
     stores.close_all()
+
+
+def test_stamped_ids_do_not_collide():
+    made = {ids.mint_stamped("RUN", "ingest") for _ in range(200)}
+    assert len(made) == 200
+    assert all(ids.is_a(m, "RUN") for m in made)

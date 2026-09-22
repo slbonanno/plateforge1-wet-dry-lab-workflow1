@@ -5,6 +5,7 @@ An ID is minted once and stored; it is never recomputed downstream.
 """
 from __future__ import annotations
 
+import itertools
 import re
 import uuid
 from datetime import datetime, timezone
@@ -38,6 +39,19 @@ def mint(prefix: str, body: str | None = None) -> str:
     if not _ID_RE.match(obj_id):
         raise ValueError(f"illegal id body {body!r}")
     return obj_id
+
+
+_SEQ = itertools.count()
+
+
+def mint_stamped(prefix: str, label: str) -> str:
+    """Mint an ID whose body carries a label and a UTC timestamp.
+
+    The timestamp is only second-resolution, so two mints in the same second
+    would collide on their own. The counter makes that impossible within a
+    process; the random token covers concurrent processes.
+    """
+    return mint(prefix, f"{label}-{stamp()}-{uuid.uuid4().hex[:6]}{next(_SEQ):x}")
 
 
 def parse(obj_id: str) -> tuple[str, str]:

@@ -92,13 +92,39 @@ tests/
 ## Roadmap
 
 - [x] Core: typed IDs, well normalisation, paths, SQLite stores, parquet bulk tables, artifact ledger
-- [ ] `library`: OAS interface, sequence pool, diversity-aware sampling
+- [x] `library`: OAS interface, sequence pool, diversity-aware sampling
 - [ ] `library`: in-silico reformatting (scFv, VHH, VH-only, CDRH3 grafting)
 - [ ] `assay`: experiment definition from JSON, plate layout
 - [ ] `assay`: reader adapters, control resolution, hit calling, QC
 - [ ] `assay`: review plots and interactive pick sessions
 - [ ] `reagents`: catalog, lot tracking, caveat rules
 - [ ] `emit`: liquid handler worklists, sequencing forms, run summaries
+
+## The sampler
+
+A discovery campaign does not yield ten interchangeable clones, so neither does
+this. Sequences are drawn across a germline panel by weight, spread across CDRH3
+length bins, and chosen greedily to maximise the minimum pairwise distance — then
+checked against explicit criteria rather than eyeballed.
+
+![Germline composition](docs/figures/fig1_germline_composition.png)
+
+The panel is data, so changing the mix is a config edit. Germline is also the
+only available handle on *behavioural* difference before real assay data exists,
+which is why the three scaffolds differ in CDRH3 length regime rather than all
+being well-behaved ones.
+
+![CDRH3 lengths](docs/figures/fig2_cdr3_lengths.png)
+
+The third figure is the one that matters: it is a visual acceptance test. Random
+draws of the same size reach much higher worst-pair identity, because a real pool
+is full of expanded clonal lineages. If the sampler regresses, this figure shows
+it immediately.
+
+![Identity check](docs/figures/fig3_identity_check.png)
+
+Reasoning and sources for the panel are in `decisions/0007`; the diversity
+criteria are in `decisions/0008`.
 
 ## Conventions worth knowing
 

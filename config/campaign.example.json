@@ -1,0 +1,30 @@
+{
+  "_comment": "Inputs for one library.sample run. Panels are data, not code.",
+  "schema_version": 1,
+  "name": "campaign-a",
+  "source": {
+    "study": "Chen_2020",
+    "unit": "SRR11937587_1_Heavy_IGHG",
+    "paired": false
+  },
+  "filter": {
+    "chain": "H",
+    "genes": ["IGHV3-23", "IGHV1-69", "IGHV3-53"],
+    "cdr3_len_range": [8, 30],
+    "min_redundancy": 2,
+    "exclude_liabilities": true,
+    "drop_duplicate_cdr3": false
+  },
+  "panel": "default-v1",
+  "sample": {
+    "n": 10,
+    "seed": 42,
+    "length_bins": 4
+  },
+  "spec": {
+    "max_pairwise_identity": 0.8,
+    "min_cdr3_len_span": 8,
+    "min_genes": 3,
+    "min_per_gene": 1
+  }
+}

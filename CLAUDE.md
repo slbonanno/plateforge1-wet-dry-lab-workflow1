@@ -61,7 +61,11 @@ A toolkit for antibody discovery workflows, built in independent modules:
 - Type hints on public functions; `from __future__ import annotations` at top
 - Deterministic functions do not touch the ledger; the caller registers results
 
-9. **Artifacts are never modified.** A re-run produces a new artifact and
+9. **Germline calls are parsed only in `library.germlines`.** OAS `v_call` can
+   be a comma-separated tie; treating it as a gene name directly produces silent
+   garbage categories.
+
+10. **Artifacts are never modified.** A re-run produces a new artifact and
    `artifacts.supersede(old, new)` records the replacement. `artifacts.current()`
    returns what has not been replaced.
 
@@ -77,9 +81,16 @@ resolve one silently — write the decision record.
 
 ## Current state
 
-`core` is built and tested (13 tests). Every other module is a stub. The
-immediate next piece of work is `library`: interfacing with OAS, downloading and
-classifying sequences, and building a diversity-aware sampling layer.
+`core` and `library` are built and tested (38 tests). `assay`, `reagents` and
+`emit` are still stubs.
+
+`library` covers OAS ingest, the sequence pool, and diversity-aware sampling. It
+is tested entirely against synthetic OAS-format units (`library.synth`), so the
+suite runs with no network and no downloaded data. A real OAS fixture is still
+outstanding (Q9).
+
+The next piece of work is `assay`: experiment definition from JSON, plate layout,
+and clone registration from a `LIB` id.
 
 Known-undecided areas are listed in `decisions/0004-open-questions.md`. Schemas
 in `core/schema/` are expected to gain columns; that is normal. What is expensive
