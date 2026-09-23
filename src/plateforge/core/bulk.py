@@ -17,11 +17,20 @@ import pandas as pd
 from . import paths
 
 
-def write(name: str, df: pd.DataFrame, append: bool = False) -> Path:
-    """Write (or append to) a bulk table. Returns the parquet path."""
+def write(name: str, df: pd.DataFrame, append: bool = False,
+          key: str | None = None) -> Path:
+    """Write (or append to) a bulk table. Returns the parquet path.
+
+    `key` makes an append idempotent on its own terms. Without it, a parquet
+    table can accumulate a second copy of everything whenever the SQLite index
+    that normally guards against re-ingest is missing or was deleted -- the two
+    halves of a store drift, and nothing notices until a count looks wrong.
+    """
     path = paths.bulk_path(name)
     if append and path.exists():
         df = pd.concat([pd.read_parquet(path), df], ignore_index=True)
+    if key and key in df.columns:
+        df = df.drop_duplicates(subset=[key], keep="first").reset_index(drop=True)
     df.to_parquet(path, index=False)
     return path
 

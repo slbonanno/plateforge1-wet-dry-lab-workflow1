@@ -114,22 +114,38 @@ def greedy_farthest(seqs: list[str], n: int, seed: int = 0) -> list[int]:
 
 def sample(candidates: pd.DataFrame, n: int, panel: germlines.Panel | None = None,
            spec: Spec | None = None, seed: int = 0,
-           length_bins: int = 4) -> pd.DataFrame:
+           length_bins: int = 4, unique_cdr3: bool = True) -> pd.DataFrame:
     """Draw n sequences spanning the panel's germlines and a range of CDRH3 lengths.
 
     `candidates` is a pool index frame (needs v_gene, cdr3_aa, cdr3_len, seq_id).
+
+    Germline quotas are filled one gene at a time, so without `unique_cdr3` the
+    same loop can be drawn once per gene -- a real repertoire contains
+    identical CDRH3s assigned to different V genes, whether by convergence or
+    an ambiguous V call. Two wells synthesising the same molecule is a wasted
+    well, so duplicates are excluded across the whole selection by default.
     """
     panel = panel or germlines.DEFAULT
     spec = spec or Spec()
     if candidates.empty:
         raise ValueError("no candidate sequences")
 
+    if unique_cdr3:
+        # Deduplicate the candidate pool first, keeping one representative per
+        # loop. Doing it here rather than per gene means a loop shared between
+        # two germlines is offered to whichever gene reaches it first.
+        candidates = candidates.drop_duplicates(subset=["cdr3_aa"]).reset_index(drop=True)
+
     quotas = panel.quotas(n)
     picks: list[pd.DataFrame] = []
     shortfall = 0
 
+    taken_cdr3: set[str] = set()
+
     for gene, quota in quotas.items():
         pool = candidates[candidates["v_gene"] == gene]
+        if unique_cdr3 and taken_cdr3:
+            pool = pool[~pool["cdr3_aa"].isin(taken_cdr3)]
         if pool.empty:
             shortfall += quota
             continue
@@ -163,14 +179,22 @@ def sample(candidates: pd.DataFrame, n: int, panel: germlines.Panel | None = Non
                 idx = greedy_farthest(list(rest["cdr3_aa"]), extra, seed=seed)
                 got = pd.concat([got, rest.iloc[idx]], ignore_index=True)
         shortfall += quota - len(got)
+        if unique_cdr3:
+            taken_cdr3.update(got["cdr3_aa"])
         picks.append(got)
 
     out = pd.concat(picks, ignore_index=True) if picks else candidates.head(0)
 
     if shortfall > 0:
-        rest = candidates[~candidates["seq_id"].isin(out["seq_id"])].reset_index(drop=True)
+        rest = candidates[~candidates["seq_id"].isin(out["seq_id"])]
+        if unique_cdr3:
+            rest = rest[~rest["cdr3_aa"].isin(taken_cdr3)]
+        rest = rest.reset_index(drop=True)
         if len(rest):
             idx = greedy_farthest(list(rest["cdr3_aa"]), min(shortfall, len(rest)), seed=seed)
             out = pd.concat([out, rest.iloc[idx]], ignore_index=True)
 
-    return out.drop(columns=[c for c in out.columns if c.startswith("_")]).reset_index(drop=True)
+    out = out.drop(columns=[c for c in out.columns if c.startswith("_")])
+    if unique_cdr3:
+        out = out.drop_duplicates(subset=["cdr3_aa"])
+    return out.reset_index(drop=True)

@@ -28,6 +28,22 @@ pool contains expanded clonal lineages.
 The check returns a report rather than raising, so a set that misses a criterion
 is still usable with the miss recorded.
 
+## Duplicate loops across germlines
+
+Added 2026-09-22 after a 96-pick on real Briney data returned
+`max_pairwise_identity: 1.0`. `TKGVGSVRNDALHI` was selected twice, once as
+IGHV3-23 and once as IGHV3-53.
+
+Quotas are filled one germline at a time, and a real repertoire contains
+identical CDRH3s assigned to different V genes — convergence, or an ambiguous
+V call. Each gene's independent selection picked the same loop. At plate scale
+that means two wells synthesising one molecule.
+
+`sample(unique_cdr3=True)` is now the default: the candidate pool is
+deduplicated on CDRH3 and each gene excludes loops already taken. When distinct
+loops run out the sampler returns fewer than asked rather than repeating, and
+the caller is told. Ordering a duplicate is worse than ordering 94 clones.
+
 ## Consequences
 
 - The criteria are defaults on a dataclass, so a campaign can tighten or relax

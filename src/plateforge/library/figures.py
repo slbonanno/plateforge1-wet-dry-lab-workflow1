@@ -291,7 +291,8 @@ def region_spans(row: pd.Series, gapped: str) -> list[tuple[str, int, int]]:
 def alignment(rows: pd.DataFrame, gene: str, out: str | Path = "fig5_alignment.png",
               max_rows: int = 24, highlight_only_differences: bool = True,
               seq_column: str = "aa_gapped", germline_column: str = "germline_aa",
-              show_regions: bool = True, allow_ragged: bool = False):
+              show_regions: bool = True, allow_ragged: bool = False,
+              use_numbering: bool = True):
     """Geneious-style alignment for one germline, against the germline reference.
 
     Every residue letter is printed. With `highlight_only_differences` (the
@@ -304,9 +305,21 @@ def alignment(rows: pd.DataFrame, gene: str, out: str | Path = "fig5_alignment.p
     OAS carries per sequence; where that is absent the observed consensus is
     used and the row is labelled as such.
     """
-    sub = rows[rows["v_gene"] == gene]
-    if sub.empty:
+    sub_all = rows[rows["v_gene"] == gene]
+    if sub_all.empty:
         raise ValueError(f"no sequences for {gene}")
+
+    # Preferred path: ANARCI IMGT numbering gives every residue its column, so
+    # ragged reads align properly instead of being excluded for being short.
+    if use_numbering:
+        drawn = _alignment_from_numbering(
+            sub_all.head(max_rows), gene, out,
+            highlight_only_differences=highlight_only_differences,
+            show_regions=show_regions)
+        if drawn is not None:
+            return drawn
+
+    sub = sub_all
     if seq_column not in sub.columns:
         raise KeyError(
             f"{seq_column!r} not in the frame; pass pool.fetch(...) output, "
@@ -391,6 +404,87 @@ def alignment(rows: pd.DataFrame, gene: str, out: str | Path = "fig5_alignment.p
         note = (f"; {dropped} of {n_total} padded to fit" if allow_ragged
                 else f"; {dropped} of {n_total} excluded as not column-aligned")
     ax.set_title(f"{gene} — {mode} {ref_label}; IMGT regions above{note}",
+                 color=INK, fontsize=11, loc="left", pad=10)
+    fig.tight_layout()
+    fig.savefig(out, facecolor="white")
+    plt.close(fig)
+    return Path(out)
+
+
+def _alignment_from_numbering(sub, gene, out, highlight_only_differences=True,
+                              show_regions=True, min_occupancy=0.02):
+    """Render an alignment built from ANARCI IMGT numbering. None if unusable."""
+    from . import imgt
+
+    aln = imgt.build(sub, min_occupancy=min_occupancy)
+    if aln is None or aln.width == 0:
+        return None
+    columns = list(aln.matrix.columns)
+    ref_map, ref_rows = imgt.germline_row(sub, columns)
+    if ref_map:
+        ref_label = f"germline (n={ref_rows})"
+    else:
+        modal = aln.matrix.mode(axis=0, dropna=True)
+        ref_map = {c: modal[c].iloc[0] for c in columns
+                   if c in modal and not modal[c].isna().all()}
+        ref_label = "consensus (germline unmappable)"
+
+    n = aln.matrix.shape[0]
+    width = aln.width
+    fig_w = min(24, max(8, width * 0.115))
+    fig, ax = plt.subplots(figsize=(fig_w, 0.26 * (n + 2) + 1.6), dpi=150)
+    show_letters = width <= 260
+
+    rows_to_draw = [(ref_label, {c: ref_map.get(c) for c in columns})] + [
+        (str(idx), dict(zip(columns, row))) for idx, row in aln.matrix.iterrows()]
+
+    for r, (label, residues) in enumerate(rows_to_draw):
+        y = n - r
+        for c, col in enumerate(columns):
+            aa = residues.get(col)
+            if not isinstance(aa, str) or not aa.strip():
+                ax.add_patch(plt.Rectangle((c, y), 1, 1, facecolor=GAP_COLOR,
+                                           edgecolor="white", linewidth=0.25))
+                continue
+            differs = r == 0 or aa != ref_map.get(col)
+            if differs or not highlight_only_differences:
+                color = AA_COLOR.get(aa, UNKNOWN_COLOR)
+                ax.add_patch(plt.Rectangle((c, y), 1, 1, facecolor=color,
+                                           edgecolor="white", linewidth=0.25))
+                ink = _text_on(color)
+            else:
+                ink = "#9c9a92"
+            if show_letters:
+                ax.text(c + 0.5, y + 0.5, aa, ha="center", va="center",
+                        fontsize=5.5, color=ink)
+        ax.text(-1.5, y + 0.5, label[:22], ha="right", va="center",
+                fontsize=7, color=INK if r == 0 else MUTED,
+                fontweight="bold" if r == 0 else "normal")
+
+    top = n + 1
+    if show_regions:
+        for name, start, end in aln.regions:
+            is_cdr = name.startswith("CDR")
+            ax.add_patch(plt.Rectangle((start, top + 0.15), end - start, 0.62,
+                                       facecolor=REGION_BAND[is_cdr],
+                                       edgecolor="white", linewidth=0.6))
+            ax.text((start + end) / 2, top + 0.46, name, ha="center", va="center",
+                    fontsize=7, color="#4a4a46",
+                    fontweight="bold" if is_cdr else "normal")
+
+    ax.set_xlim(-0.5, width + 0.5)
+    ax.set_ylim(-0.4, top + 1.1)
+    ticks = list(range(0, width, 10))
+    ax.set_xticks(ticks)
+    ax.set_xticklabels([str(columns[t]).strip() for t in ticks],
+                       fontsize=7, color=MUTED)
+    ax.set_yticks([])
+    for side in ("top", "right", "left"):
+        ax.spines[side].set_visible(False)
+    ax.spines["bottom"].set_color(GRID)
+    ax.tick_params(colors=MUTED, length=2)
+    mode = "differences highlighted vs" if highlight_only_differences else "full colour vs"
+    ax.set_title(f"{gene} — {mode} {ref_label}; IMGT numbered columns",
                  color=INK, fontsize=11, loc="left", pad=10)
     fig.tight_layout()
     fig.savefig(out, facecolor="white")

@@ -1,3 +1,5 @@
+import os
+
 import pandas as pd
 import pytest
 
@@ -201,11 +203,45 @@ def test_sample_respects_panel(tmp_path):
 
 
 def test_sampled_set_passes_spec(tmp_path):
+    # A realistic CDRH3 floor, as every real run uses. Without it the sampler
+    # draws 5-residue loops, and two random 5-mers differing at one position
+    # are 0.8 identical by arithmetic -- the spec then sits exactly on its own
+    # limit and the test measures rounding rather than diversity.
     src = synth.make_unit(tmp_path / "unit.csv.gz", n=900, seed=10)
-    df, _ = oas.load(src)
+    df, _ = oas.load(src, oas.Filter(cdr3_len_range=(8, 30)))
     picked = diversity.sample(df, 10, seed=3)
     report = diversity.Spec(min_genes=3).check(picked)
     assert report["pass"], report
+    assert report["max_pairwise_identity"]["value"] < 0.75, \
+        "should clear the limit with margin, not sit on it"
+
+
+def test_short_cdr3s_are_inherently_similar(tmp_path):
+    """Documents why the spec needs a length floor: normalized identity on
+    short loops is high no matter how the sampler behaves."""
+    assert diversity.identity("ARHDY", "ARMDY") == 0.8
+    assert diversity.identity("ARHDYWQGTL", "ARMDYWQGTL") == 0.9
+
+
+def test_generation_is_reproducible_across_processes(tmp_path):
+    """Python randomises string hashing per process. Iterating a set while
+    consuming the RNG therefore made the same seed produce different data on
+    different machines -- which is exactly how this was found. Guard it."""
+    import hashlib
+    import subprocess
+    import sys
+    import gzip
+
+    digests = set()
+    for hashseed in ("0", "1", "12345"):
+        out = tmp_path / f"u{hashseed}.csv.gz"
+        subprocess.run(
+            [sys.executable, "-c",
+             "from plateforge.library import synth;"
+             f"synth.make_unit({str(out)!r}, n=400, seed=10)"],
+            check=True, env={**os.environ, "PYTHONHASHSEED": hashseed})
+        digests.add(hashlib.sha256(gzip.open(out, "rb").read()).hexdigest())
+    assert len(digests) == 1, "same seed must produce identical data in any process"
 
 
 def test_spec_catches_a_bad_set():
@@ -650,3 +686,364 @@ def test_unknown_flags_are_treated_as_liabilities():
 def test_mixed_status_is_a_liability_if_any_flag_is_structural():
     status = "|Shorter than IMGT defined: fw1|Missing Conserved Cysteine: 104|"
     assert oas._has_liability(status)
+
+
+# --- IMGT numbering alignment (Q12) ---------------------------------------
+
+REAL_NUMBERING = (
+    "{'fwh1': {'15 ': 'P', '16 ': 'G', '23 ': 'C'}, "
+    "'cdrh1': {'27 ': 'G', '35 ': 'S'}, "
+    "'cdrh3': {'111 ': 'G', '111A': 'I', '112A': 'D', '112 ': 'R', '113 ': 'D'}, "
+    "'fwh4': {'118 ': 'W'}}"
+)
+
+
+def test_parse_real_numbering():
+    from plateforge.library import imgt
+    parsed = imgt.parse(REAL_NUMBERING)
+    assert set(parsed) == {"fwh1", "cdrh1", "cdrh3", "fwh4"}
+    assert parsed["cdrh3"]["111A"] == "I"
+
+
+def test_parse_rejects_junk():
+    from plateforge.library import imgt
+    for bad in [None, "", "not a dict", 42, "{unclosed"]:
+        assert imgt.parse(bad) is None
+
+
+def test_imgt_insertion_order_is_outward_from_the_middle():
+    from plateforge.library import imgt
+    cols = ["112 ", "111A", "112B", "111 ", "112A", "113 ", "110 "]
+    assert sorted(cols, key=imgt.position_key) == [
+        "110 ", "111 ", "111A", "112B", "112A", "112 ", "113 "]
+
+
+def test_position_key_handles_unparseable():
+    from plateforge.library import imgt
+    assert imgt.position_key("???")[0] == 10_000
+
+
+def test_build_puts_ragged_sequences_in_shared_columns(tmp_path):
+    from plateforge.library import imgt
+    src = synth.make_unit(tmp_path / "unit.csv.gz", n=400, seed=80)
+    df, _ = oas.load(src)
+    sub = df[df["v_gene"] == df["v_gene"].value_counts().index[0]].head(30)
+    assert sub["aa_gapped"].str.len().nunique() >= 1
+
+    aln = imgt.build(sub)
+    assert aln is not None
+    # every row spans the same columns, whatever its length
+    assert aln.matrix.shape[0] == len(sub)
+    assert aln.width > 100
+    labels = [r[0] for r in aln.regions]
+    assert labels == ["FR1", "CDR1", "FR2", "CDR2", "FR3", "CDR3", "FR4"]
+
+
+def test_build_regions_tile_without_gaps(tmp_path):
+    from plateforge.library import imgt
+    src = synth.make_unit(tmp_path / "unit.csv.gz", n=200, seed=81)
+    df, _ = oas.load(src)
+    aln = imgt.build(df.head(20))
+    ends = [0]
+    for _label, start, end in aln.regions:
+        assert start == ends[-1], "regions must tile the alignment"
+        ends.append(end)
+    assert ends[-1] == aln.width
+
+
+def test_build_returns_none_without_numbering():
+    from plateforge.library import imgt
+    assert imgt.build(pd.DataFrame({"seq_id": ["a"]})) is None
+
+
+def test_min_occupancy_trims_rare_insertions(tmp_path):
+    from plateforge.library import imgt
+    src = synth.make_unit(tmp_path / "unit.csv.gz", n=400, seed=82)
+    df, _ = oas.load(src)
+    sub = df.head(60)
+    wide = imgt.build(sub, min_occupancy=0.0)
+    trimmed = imgt.build(sub, min_occupancy=0.5)
+    assert trimmed.width <= wide.width
+
+
+def test_germline_maps_onto_the_same_columns(tmp_path):
+    from plateforge.library import imgt
+    src = synth.make_unit(tmp_path / "unit.csv.gz", n=300, seed=83)
+    df, _ = oas.load(src)
+    sub = df[df["v_gene"] == df["v_gene"].value_counts().index[0]].head(20)
+    aln = imgt.build(sub)
+    ref, used = imgt.germline_row(sub, list(aln.matrix.columns))
+    assert used > 0, "germline should map for at least some rows"
+    assert set(ref).issubset(set(aln.matrix.columns))
+
+
+def test_germline_refuses_to_shift_when_counts_disagree():
+    from plateforge.library import imgt
+    row = pd.Series({
+        "anarci_numbering": REAL_NUMBERING,     # 11 numbered residues
+        "aa_gapped": "QVQ",                     # nowhere near 11
+        "germline_aa": "QVQ",
+    })
+    assert imgt.germline_by_column(row) is None
+
+
+def test_germline_refuses_on_length_mismatch():
+    from plateforge.library import imgt
+    row = pd.Series({"anarci_numbering": REAL_NUMBERING,
+                     "aa_gapped": "QVQLL", "germline_aa": "QVQ"})
+    assert imgt.germline_by_column(row) is None
+
+
+def test_alignment_figure_prefers_numbering(tmp_path, monkeypatch):
+    _fresh(tmp_path, monkeypatch)
+    from plateforge.library import figures
+    src = synth.make_unit(tmp_path / "unit.csv.gz", n=800, seed=84)
+    df, meta = oas.load(src)
+    pool.ingest(df, meta)
+    full = pool.fetch(list(pool.index()["seq_id"]),
+                      columns=["seq_id", "v_gene", "aa_gapped", "germline_aa",
+                               "anarci_numbering"])
+    gene = full["v_gene"].value_counts().index[0]
+    p = figures.alignment(full, gene, tmp_path / "numbered.png", max_rows=12)
+    assert p.exists() and p.stat().st_size > 5_000
+    q = figures.alignment(full.drop(columns=["anarci_numbering"]), gene,
+                          tmp_path / "fallback.png", max_rows=12)
+    assert q.exists() and q.stat().st_size > 5_000
+    stores.close_all()
+
+
+# --- store consistency -----------------------------------------------------
+
+def test_pool_survives_losing_its_index(tmp_path, monkeypatch):
+    _fresh(tmp_path, monkeypatch)
+    from plateforge.core import paths
+    src = synth.make_unit(tmp_path / "unit.csv.gz", n=300, seed=85)
+    df, meta = oas.load(src)
+    pool.ingest(df, meta)
+    first = pool.consistency()
+    assert first["consistent"]
+
+    stores.close_all()
+    for f in paths.data_root().glob("stores/library.sqlite*"):
+        f.unlink()
+    pool.ingest(df, meta)                      # parquet must not double
+    after = pool.consistency()
+    assert after["consistent"], after
+    assert after["in_parquet"] == first["in_parquet"]
+    stores.close_all()
+
+
+def test_repair_drops_orphan_parquet_rows(tmp_path, monkeypatch):
+    _fresh(tmp_path, monkeypatch)
+    from plateforge.core import bulk
+    src = synth.make_unit(tmp_path / "unit.csv.gz", n=200, seed=86)
+    df, meta = oas.load(src)
+    pool.ingest(df, meta)
+    orphan = bulk.read(pool.POOL_TABLE).head(3).copy()
+    orphan["seq_id"] = ["SEQ-orphan1", "SEQ-orphan2", "SEQ-orphan3"]
+    bulk.write(pool.POOL_TABLE, orphan, append=True, key="seq_id")
+    assert pool.consistency()["parquet_only"] == 3
+    assert pool.repair()["consistent"]
+    stores.close_all()
+
+
+# --- schema migration (Q8) -------------------------------------------------
+
+def test_missing_columns_are_added_to_an_existing_database(tmp_path, monkeypatch):
+    import sqlite3
+    monkeypatch.setenv("PLATEFORGE_DATA", str(tmp_path))
+    stores.close_all()
+    from plateforge.core import paths
+
+    store_dir = paths.data_root() / "stores"
+    store_dir.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(store_dir / "library.sqlite")
+    conn.executescript("""CREATE TABLE IF NOT EXISTS sequences (
+        seq_id TEXT PRIMARY KEY, source TEXT NOT NULL,
+        aa_seq TEXT NOT NULL, created_at TEXT NOT NULL);""")
+    conn.execute("INSERT INTO sequences VALUES ('SEQ-old','OAS','QVQL','2026-01-01')")
+    conn.commit()
+    conn.close()
+
+    live = stores.connect("library")
+    cols = {r[1] for r in live.execute("PRAGMA table_info(sequences)")}
+    assert {"n_ambiguous", "cdr3_len", "v_gene"} <= cols
+    assert live.execute("SELECT seq_id FROM sequences").fetchone()[0] == "SEQ-old"
+    stores.close_all()
+
+
+def test_migration_is_idempotent(tmp_path, monkeypatch):
+    monkeypatch.setenv("PLATEFORGE_DATA", str(tmp_path))
+    stores.close_all()
+    conn = stores.connect("library")
+    schema = (stores.SCHEMA_DIR / "library.sql").read_text()
+    assert stores.migrate(conn, schema) == []
+    stores.close_all()
+
+
+def test_declared_columns_skips_table_constraints():
+    schema = """CREATE TABLE IF NOT EXISTS t (
+        a TEXT PRIMARY KEY,
+        b INTEGER DEFAULT 0,
+        PRIMARY KEY (a, b)
+    );"""
+    cols = stores.declared_columns(schema)["t"]
+    assert set(cols) == {"a", "b"}
+
+
+# --- germline reference resolution -----------------------------------------
+
+IMGT_FASTA = """>M99660|IGHV3-23*01|Homo sapiens|F|V-REGION|1..296|296 nt|1| | | | |
+EVQLLESGG.GLVQPGGSLRLSCAASGFTF....SSYAMSWVRQAPGKGLEWVSAISGSG..GSTYYADSVKG
+RFTISRDNSKNTLYLQMNSLRAEDTAVYYCAK
+>M99660|IGHV3-23*04|Homo sapiens|F|V-REGION|1..296|296 nt|1| | | | |
+EVQLLESGG.GLVQPGGSLRLSCAASGFTF....SSYTMSWVRQAPGKGLEWVSAISGSG..GSTYYADSVKG
+>X59315|IGKV1-39*01|Homo sapiens|F|V-REGION|1..289|
+DIQMTQSPSSLSASVGDRVTITCRASQSIS..SYLNWYQQKPGKAPKLLIYAA....STLQSGVPSRF
+>Z12345|IGHV9-99*01|Mus musculus|P|V-REGION|1..280|
+QVQLKESGPG
+"""
+
+
+def test_imgt_fasta_parses_header_fields():
+    from plateforge.library import germline_db as gdb
+    db = gdb.parse_imgt_fasta(IMGT_FASTA)
+    assert db["IGHV3-23"].allele == "IGHV3-23*01"
+    assert db["IGHV3-23"].functionality == "F"
+    assert db["IGKV1-39"].sequence.startswith("DIQMTQSPSS")
+    assert db["IGHV9-99"].functionality == "P"
+
+
+def test_imgt_fasta_strips_gaps_and_joins_lines():
+    from plateforge.library import germline_db as gdb
+    seq = gdb.parse_imgt_fasta(IMGT_FASTA)["IGHV3-23"].sequence
+    assert "." not in seq and "-" not in seq
+    assert seq.startswith("EVQLLESGGGLVQPGGSLRLSCAASGFTFSSYAMS")
+    assert seq.endswith("YYCAK"), "later lines of the record must be joined"
+
+
+def test_first_allele_wins():
+    from plateforge.library import germline_db as gdb
+    # *01 appears before *04 and carries AMS; *04 carries TMS.
+    assert "SSYAMS" in gdb.parse_imgt_fasta(IMGT_FASTA)["IGHV3-23"].sequence
+
+
+def test_fasta_source_is_authoritative_not_derived(tmp_path):
+    from plateforge.library import germline_db as gdb
+    path = tmp_path / "imgt.fasta"
+    path.write_text(IMGT_FASTA)
+    found = gdb.from_fasta("IGKV1-39", path)
+    assert found.source == "fasta"
+    assert not found.is_derived
+
+
+def test_resolve_prefers_fasta_over_pool(tmp_path, monkeypatch):
+    _fresh(tmp_path, monkeypatch)
+    from plateforge.library import germline_db as gdb
+    src = synth.make_unit(tmp_path / "unit.csv.gz", n=1200, seed=90)
+    df, meta = oas.load(src, oas.Filter(cdr3_len_range=(8, 30)))
+    pool.ingest(df, meta)
+    path = tmp_path / "imgt.fasta"
+    path.write_text(IMGT_FASTA)
+
+    assert gdb.resolve("IGHV3-23", fasta_path=path).source == "fasta"
+    assert gdb.resolve("IGHV3-23", order=("pool",)).source == "pool"
+    stores.close_all()
+
+
+def test_pool_germline_is_labelled_and_supported(tmp_path, monkeypatch):
+    _fresh(tmp_path, monkeypatch)
+    from plateforge.library import germline_db as gdb
+    src = synth.make_unit(tmp_path / "unit.csv.gz", n=1500, seed=91)
+    df, meta = oas.load(src, oas.Filter(cdr3_len_range=(8, 30)))
+    pool.ingest(df, meta)
+
+    found = gdb.resolve("IGHV3-23", order=("pool",))
+    assert found.is_derived and found.support > 50
+    assert "covers only the span" in found.notes
+    assert len(found.sequence) > 80
+    stores.close_all()
+
+
+def test_pool_refuses_below_min_support(tmp_path, monkeypatch):
+    _fresh(tmp_path, monkeypatch)
+    from plateforge.library import germline_db as gdb
+    src = synth.make_unit(tmp_path / "unit.csv.gz", n=600, seed=92)
+    df, meta = oas.load(src, oas.Filter(cdr3_len_range=(8, 30)))
+    pool.ingest(df, meta)
+    assert gdb.from_pool("IGHV3-23", min_support=100_000) is None
+    stores.close_all()
+
+
+def test_resolve_returns_none_for_unknown_gene(tmp_path, monkeypatch):
+    _fresh(tmp_path, monkeypatch)
+    from plateforge.library import germline_db as gdb
+    assert gdb.resolve("IGHV0-00", order=("pool",)) is None
+    stores.close_all()
+
+
+def test_coverage_report_flags_derived(tmp_path, monkeypatch):
+    _fresh(tmp_path, monkeypatch)
+    from plateforge.library import germline_db as gdb
+    src = synth.make_unit(tmp_path / "unit.csv.gz", n=1200, seed=93)
+    df, meta = oas.load(src, oas.Filter(cdr3_len_range=(8, 30)))
+    pool.ingest(df, meta)
+    path = tmp_path / "imgt.fasta"
+    path.write_text(IMGT_FASTA)
+
+    rep = gdb.coverage_report(["IGHV3-23", "IGHV1-69", "IGHV0-00"],
+                              fasta_path=path).set_index("gene")
+    assert rep.loc["IGHV3-23", "source"] == "fasta"
+    assert rep.loc["IGHV1-69", "source"] == "pool"       # not in the fixture
+    assert not rep.loc["IGHV0-00", "resolved"]
+    stores.close_all()
+
+
+# --- cross-germline duplicate CDRH3s ---------------------------------------
+
+def _shared_loop_candidates():
+    """Every germline drawing from the same small loop set, so any per-gene
+    selection must collide unless duplicates are excluded globally."""
+    loops = ["ARWGYFDY", "ARLLPQMDY", "ARKKTVSGFDY", "ARQWWEYMDV",
+             "ARHNPLTGDY", "ARFFIKSMDL", "ARVVDNQYFDY", "ARCCMAWGDY"]
+    rows = [{"seq_id": f"SEQ-{gene}-{i}", "v_gene": gene,
+             "cdr3_aa": loop, "cdr3_len": len(loop)}
+            for gene in germlines.DEFAULT.genes for i, loop in enumerate(loops)]
+    return pd.DataFrame(rows)
+
+
+def test_same_cdr3_under_two_genes_is_not_picked_twice():
+    cands = _shared_loop_candidates()
+    picked = diversity.sample(cands, 12, seed=1)
+    assert len(picked) == picked["cdr3_aa"].nunique(), \
+        "the same loop must not be ordered twice"
+
+
+def test_duplicates_appear_without_the_guard():
+    # Documents the bug this guards: real data has identical CDRH3s assigned
+    # to different V genes, and per-gene quotas would each pick them.
+    cands = _shared_loop_candidates()
+    loose = diversity.sample(cands, 12, seed=1, unique_cdr3=False)
+    assert len(loose) > loose["cdr3_aa"].nunique()
+    assert diversity.Spec(min_genes=3).check(loose)["max_pairwise_identity"]["value"] == 1.0
+
+
+def test_sampler_returns_fewer_rather_than_repeating():
+    cands = _shared_loop_candidates()          # only 8 distinct loops
+    picked = diversity.sample(cands, 12, seed=1)
+    assert len(picked) == 8
+    assert picked["cdr3_aa"].nunique() == 8
+
+
+def test_plate_sized_pick_is_duplicate_free(tmp_path, monkeypatch):
+    _fresh(tmp_path, monkeypatch)
+    src = synth.make_unit(tmp_path / "unit.csv.gz", n=12000, seed=95)
+    df, meta = oas.load(src, oas.Filter(cdr3_len_range=(8, 30)))
+    pool.ingest(df, meta)
+    picked = diversity.sample(pool.index(), 96, seed=1)
+    assert len(picked) == 96
+    assert picked["cdr3_aa"].nunique() == 96
+    report = diversity.Spec(min_genes=3).check(picked)
+    assert report["max_pairwise_identity"]["value"] < 1.0
+    assert report["pass"], report
+    stores.close_all()

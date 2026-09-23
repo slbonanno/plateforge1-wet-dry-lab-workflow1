@@ -45,6 +45,9 @@ def main() -> None:
     ap.add_argument("--out", default="figures/real")
     ap.add_argument("--any-gene", action="store_true",
                     help="do not restrict to the panel germlines")
+    ap.add_argument("--allow-duplicate-cdr3", action="store_true",
+                    help="permit the same CDRH3 under different V genes "
+                         "(off by default: two wells, one molecule)")
     ap.add_argument("--explain", action="store_true",
                     help="print the filter funnel even when rows survive")
     ap.add_argument("--keep-liabilities", action="store_true",
@@ -114,8 +117,13 @@ def main() -> None:
     print("\ncolumn alignment per germline (the alignment figure needs this):")
     print(_hf.alignment_report(full).head(8).to_string(index=False))
 
-    picked = diversity.sample(idx, args.pick, seed=args.seed)
+    picked = diversity.sample(idx, args.pick, seed=args.seed,
+                              unique_cdr3=not args.allow_duplicate_cdr3)
     print("\n" + picked[["seq_id", "v_gene", "cdr3_aa", "cdr3_len"]].to_string(index=False))
+    if len(picked) < args.pick:
+        print(f"\nasked for {args.pick}, got {len(picked)}: the pool ran out of "
+              "distinct CDRH3s. Widen the filters or lower --pick; padding with "
+              "repeats would mean ordering the same molecule twice.")
 
     report = diversity.Spec(min_genes=1).check(picked)
     print("\ndiversity report")

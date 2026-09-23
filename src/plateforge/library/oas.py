@@ -295,6 +295,11 @@ def normalize(df: pd.DataFrame, meta: dict, source_ref: str) -> pd.DataFrame:
     out["cdr3_aa"] = cdr3.astype(str)
     out["cdr3_len"] = out["cdr3_aa"].str.len()
 
+    # Per-residue IMGT numbering. This is what makes a true column alignment
+    # possible for ragged reads; see library.imgt.
+    numbering = out.get("ANARCI_numbering")
+    out["anarci_numbering"] = numbering if numbering is not None else None
+
     status = out.get("ANARCI_status")
     out["anarci_status"] = status if status is not None else ""
     out["has_liability"] = out["anarci_status"].map(_has_liability)

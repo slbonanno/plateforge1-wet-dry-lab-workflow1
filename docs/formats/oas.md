@@ -126,9 +126,20 @@ different spans of the domain. `hf.alignment_report()` measures this, and
 excluded rather than padding them into the wrong register — correct, but it
 discards most of the data.
 
-The real fix is `ANARCI_numbering`, which the mirror carries: per-residue IMGT
-position labels, which is exactly what is needed to place ragged sequences into
-shared columns. Not yet implemented.
+`ANARCI_numbering` solves this and is now used (decisions/0010). It carries a
+per-residue IMGT position per region:
+
+```
+{'fwh1': {'15 ': 'P', '16 ': 'G', ...},
+ 'cdrh3': {'111 ': 'G', '111A': 'I', '112A': 'D', '112 ': 'R', ...},
+ 'fwh4': {'118 ': 'W', ...}}
+```
+
+Every residue knows its column, so ragged reads align with no aligner, and the
+regions come from the same structure — including FR4, which the `fwr*_aa`
+columns do not provide. Note the insertion ordering: IMGT inserts into CDR3
+outward from the middle, `111, 111A, 111B, … 112C, 112B, 112A, 112`, so a
+string sort of position labels is wrong.
 
 **Safari corrupts `.csv.gz` downloads** by auto-unzipping. OPIG warns about
 this; use another browser or turn the setting off.

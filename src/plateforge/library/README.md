@@ -15,7 +15,11 @@ Sequence acquisition and in-silico construct generation.
 | `diversity.py` | Diversity-aware sampling and the acceptance criteria |
 | `synth.py` | Synthetic OAS-format units for testing and dummy-data generation |
 | `hf.py` | Reads the HuggingFace parquet mirror; maps its `meta_*` columns back to an OAS metadata dict |
+| `imgt.py` | Builds a true column alignment from ANARCI IMGT numbering |
+| `germline_db.py` | Germline references by gene name, from IMGT or derived from the pool |
 | `figures.py` | Regenerable figures; figure 3 is a visual acceptance test |
+| `construct.py` | scFv and VH-only assembly, clone minting, plate layout |
+| `codon.py` | Reverse translation, GC balancing, BsaI and homopolymer removal |
 
 Two entry points:
 
@@ -114,6 +118,52 @@ alone — that is perception, not palette design — so hues were chosen by
 maximising the minimum pairwise OKLab distance under normal, deuteranopic and
 protanopic vision within each band (worst pair ≈5.0 ΔE), and the residue letter
 is drawn in every cell with ink picked per fill luminance.
+
+## From picked sequences to an order
+
+```bash
+python scripts/order.py --pick 94 --reserve A01 H12
+```
+
+Writes to `outputs/<clone-set-id>/`:
+
+| File | Contents |
+|---|---|
+| `clones.csv` | one row per clone: ids, construct, protein, DNA, GC, warnings, well |
+| `plate_map.csv` | the 96-well layout as a table |
+| `plate_map.txt` | the same as a grid, CDRH3 per well, for reading at the bench |
+| `alignment_<gene>.png` | the clones that will be synthesised |
+
+This is where a `SEQ` becomes a `CLN` (decisions/0005). DNA is reverse
+translated with human codon usage, balanced to mid-GC, and stripped of the
+assembly enzyme's site on both strands and of homopolymer runs — see
+decisions/0013 for what real output forced.
+
+Vendor order forms are deliberately absent: those need a real template in
+`fixtures/` first (Q15), and Gibson/HiFi adapters need the destination vector
+(Q16).
+
+## Germline references
+
+```bash
+python scripts/germlines.py --download        # cache IMGT/GENE-DB once
+python scripts/germlines.py --panel --show    # resolve the scaffold panel
+```
+
+Sources are tried in order and every result says where it came from. `fasta`
+and `url` are IMGT and authoritative; `pool` is a per-column consensus of the
+germline OAS reports for that gene — no network, but it covers only genes in
+the pool and only the span the reads covered, which for 5' truncated amplicons
+is not all of FR1. Check `is_derived` before treating one as a reference.
+
+## Reproducibility
+
+Synthetic generation is seeded and must produce identical data in any process.
+That is not automatic: Python randomises string hashing per process, so
+iterating a `set` while consuming the RNG makes the same seed yield different
+data on different machines. `test_generation_is_reproducible_across_processes`
+guards it by running generation under several `PYTHONHASHSEED` values and
+comparing digests.
 
 ## Storage
 

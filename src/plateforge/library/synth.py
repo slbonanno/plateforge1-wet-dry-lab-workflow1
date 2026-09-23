@@ -47,6 +47,30 @@ CDR3_SLOT = 34
 # in preference to anything here.
 REGION_SPLITS = ((0, 25), (25, 33), (33, 50), (50, 58), (58, None))
 
+# Nominal IMGT start positions per region, used to emit an ANARCI_numbering
+# that behaves like the real thing: positions per residue, insertion letters in
+# CDR3 when the loop runs long.
+REGION_STARTS = (("fwh1", 1), ("cdrh1", 27), ("fwh2", 39), ("cdrh2", 56),
+                 ("fwh3", 66), ("cdrh3", 105), ("fwh4", 118))
+
+
+def _number_region(name: str, start: int, residues: str) -> dict[str, str]:
+    """Assign IMGT positions, adding 111A.../112A... insertions in a long CDR3."""
+    if name != "cdrh3" or len(residues) <= 13:
+        return {f"{start + i} ": aa for i, aa in enumerate(residues)}
+    # Anchor the ends, then insert outward from the middle as IMGT does.
+    head, tail = residues[:7], residues[-6:]
+    middle = residues[7:-6]
+    out = {f"{105 + i} ": aa for i, aa in enumerate(head)}
+    half = (len(middle) + 1) // 2
+    for i, aa in enumerate(middle[:half]):
+        out[f"111{chr(65 + i)}"] = aa
+    for i, aa in enumerate(reversed(middle[half:])):
+        out[f"112{chr(65 + i)}"] = aa
+    for i, aa in enumerate(tail):
+        out[f"{112 + i} "] = aa
+    return out
+
 # The framework strings above end at the conserved cysteine plus the first two
 # CDRH3 residues (…CAR / …CAK). _cdr3() already emits those two, so trim them
 # here; otherwise the regions overlap and would not concatenate back into the
@@ -137,12 +161,17 @@ def make_unit(path: str | Path, n: int = 500, genes: list[str] | None = None,
                "sequence_alignment_aa", "germline_alignment_aa",
                "v_germline_alignment_aa", "fwr1_aa", "cdr1_aa", "fwr2_aa",
                "cdr2_aa", "fwr3_aa", "cdr3", "cdr3_aa", "junction_aa",
-               "v_identity", "j_identity", "Redundancy", "ANARCI_status", "Isotype"]
+               "v_identity", "j_identity", "Redundancy", "ANARCI_status",
+               "ANARCI_numbering", "Isotype"]
 
     # Draw each germline's loops as a population so lineages stay within a gene.
     assignments = [rng.choice(genes) for _ in range(n)]
     loops: dict[str, list[str]] = {}
-    for g in set(assignments):
+    # sorted(), not set(): set iteration order for strings varies per process
+    # because Python randomises string hashing, and the RNG is consumed inside
+    # this loop. Iterating a set made the same seed produce different data on
+    # different runs -- reproducibility is the whole point of seeding.
+    for g in sorted(set(assignments)):
         _, _, mean_len, spread = FRAMEWORKS[g]
         loops[g] = _cdr3_population(rng, assignments.count(g), mean_len, spread,
                                     hydrophobic=(g == "IGHV1-69"), clonality=clonality)
@@ -171,6 +200,10 @@ def make_unit(path: str | Path, n: int = 500, genes: list[str] | None = None,
             # Regions are sliced from the OBSERVED sequence, after SHM, which
             # is what IgBlast reports for real data.
             regions = [aa[:len(fr)][a:b] for a, b in REGION_SPLITS] + [cdr3]
+            numbering = {}
+            for (rname, rstart), residues in zip(REGION_STARTS,
+                                                 regions[:5] + [cdr3, fr4]):
+                numbering[rname] = _number_region(rname, rstart, residues)
             if rng.random() < ambiguous_rate:
                 chars = list(aa)
                 start = rng.randrange(0, max(1, len(chars) - 10))
@@ -186,6 +219,6 @@ def make_unit(path: str | Path, n: int = 500, genes: list[str] | None = None,
                 "N" * 30, aa, germline_aa, v_germline_aa,
                 *regions[:5], "NNN", regions[5], "C" + cdr3 + "W",
                 round(rng.uniform(0.85, 1.0), 3), round(rng.uniform(0.85, 1.0), 3),
-                rng.randint(1, 50), liability, "IGHG",
+                rng.randint(1, 50), liability, repr(numbering), "IGHG",
             ])
     return path

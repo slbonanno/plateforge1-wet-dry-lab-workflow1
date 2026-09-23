@@ -27,7 +27,7 @@ def ingest(df: pd.DataFrame, meta: dict, produced_by: str = "library.oas") -> st
         fresh = df
 
     if len(fresh):
-        bulk.write(POOL_TABLE, fresh, append=True)
+        bulk.write(POOL_TABLE, fresh, append=True, key="seq_id")
         conn = stores.connect("library")
         cols = [c for c in oas.INDEX_COLUMNS if c in fresh.columns]
         rows = fresh[cols].copy()
@@ -66,9 +66,44 @@ def index(where: str | None = None, params: tuple = ()) -> pd.DataFrame:
 
 
 def fetch(seq_ids: list[str], columns: list[str] | None = None) -> pd.DataFrame:
-    """Full parquet rows for a set of seq_ids."""
+    """Full parquet rows for a set of seq_ids, one row per id."""
     df = bulk.read(POOL_TABLE, columns=columns)
-    return df[df["seq_id"].isin(seq_ids)].reset_index(drop=True)
+    out = df[df["seq_id"].isin(seq_ids)]
+    return out.drop_duplicates(subset=["seq_id"]).reset_index(drop=True)
+
+
+def consistency() -> dict:
+    """Compare the SQLite index against the parquet table.
+
+    The two are written together and can only drift if one is deleted or a
+    write fails part way. Drift is silent otherwise: counts just look wrong
+    somewhere downstream.
+    """
+    indexed = known_ids()
+    try:
+        stored = set(bulk.read(POOL_TABLE, columns=["seq_id"])["seq_id"])
+    except FileNotFoundError:
+        stored = set()
+    return {
+        "in_index": len(indexed),
+        "in_parquet": len(stored),
+        "index_only": len(indexed - stored),
+        "parquet_only": len(stored - indexed),
+        "consistent": indexed == stored,
+    }
+
+
+def repair() -> dict:
+    """Drop parquet rows the index does not know about. Additive only:
+    it never deletes from the index, which is the record of what was ingested."""
+    before = consistency()
+    if before["consistent"] or not before["parquet_only"]:
+        return before
+    indexed = known_ids()
+    df = bulk.read(POOL_TABLE)
+    kept = df[df["seq_id"].isin(indexed)].drop_duplicates(subset=["seq_id"])
+    bulk.write(POOL_TABLE, kept.reset_index(drop=True))
+    return consistency()
 
 
 def stats() -> dict[str, Any]:
