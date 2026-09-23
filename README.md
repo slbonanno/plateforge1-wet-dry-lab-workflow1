@@ -1,28 +1,36 @@
 # plateforge
 
-A toolkit for running antibody discovery workflows end to end — from sequence
-library through plate-based screening to the files that drive a liquid handler.
+This project is a predecessor to an interactive experience (agent) that helps plan experiments, generate virtual representations, track workflows and sample IDs across different (connected) experiments, reformat and process data when necessary to generate files to march along the workflow, and generate low-lift and standard figures for basic experimental workflows in the wet lab.
 
-> **Status: early.** The core layer is built and tested. The domain modules are
-> scaffolded with their contracts declared and their implementations pending.
-> The architecture is the deliverable right now, not the biology.
+As an example, this project is designed for running antibody discovery workflows.
 
-## Why
+> **Status:** Data layers v0 are built, architecture is sketched out.  development is focused on a functional workflow from start to finish for standardized input.  Expanding tolerance of different inputs/formats at different steps of the workflow will be most of the focus of dev for this project.
 
-Antibody discovery generates a specific kind of mess. A screening campaign
-produces plates of clones, each read on an instrument that exports its own
-dialect of CSV, analysed against controls that live somewhere else, filtered
-down to hits, rearrayed onto new plates by a robot that wants yet another file
-format, and finally submitted for sequencing on a form designed by a vendor.
-Provenance leaks at every step, and by the time a clone reaches sequencing it is
-often hard to reconstruct which well on which plate it came from, or what
-reagents were used to call it a hit.
+## Basic workflow:
 
-Most of that work is deterministic. It is also error-prone, tedious, and done by
-hand at most benches. `plateforge` treats the whole path as one traceable
-pipeline, with the clone — not the plate — as the entity that persists.
+#### 1. obtain antibody sequences
+1. antibodies are discovered or sequences are generated - an input list for an experiment should at minimum have a full aa sequence.  For this project, VH's will be sourced from OAS.
+2. curate sequence list - trim if necessary
 
-## Design
+#### 2. process for ordering (cloning)
+1. sequences are built into a table and given a master sequence ID - immutable and forever unique
+2. [expand] generate DNA sequences to be synthesized. assume scFv with fixed VL
+outs:
+2A) order forms for IDT, GenScript, and Genewiz
+2B) table with metadata for sequences: cloneID, clone_aa_seq, clone_DNA_seq (Hu codon opt), Frag_to_order (Gibson/HiFi/InFusion adapters), Hu_germline (query IMGT), 
+2C) alignment for the clones to be synthesized
+3. generate plate map for DNA sequences as expected from vendor
+
+#### 3. generate experiment for cloning in wet lab
+1. using plate map from 2), calculate master mixes required for cloning.
+*Golden Gate/TypeIIs is most robust for quick-cloning:
+pre-digested vector, DNA fragments (digest delivered frags in-plate), T4 ligase.
+Built-in selection against wrong products: vector recircularizes without insert - recognition site regenerated and re-cut in same rxn, equilibrium is pushed toward correct ligation*
+2. [expand] generate Sanger sequencing order forms (plate format) for Genewiz, ELIM, other providers
+3. 
+
+
+## Data architecture v0
 
 Five modules, deliberately independent:
 
@@ -36,39 +44,13 @@ Five modules, deliberately independent:
 
 Four ideas hold it together:
 
-**Modules never import each other.** A module produces something, registers it
-in a ledger with a typed ID, and returns that ID. The next module resolves the
-ID. Provenance becomes a queryable graph rather than a call stack, and every
-module runs and tests independently.
+**Modules never import each other.** A module produces something, registers it in a ledger with a typed ID, and returns that ID. The next module resolves the ID. Provenance becomes a queryable graph rather than a call stack, and every module runs and tests independently.
 
-**The clone is the durable entity.** IDs are minted once and carried forward. A
-clone stays traceable from growth plate through ELISA plate through rearray to
-sequencing tube, across as many physical plate changes as the campaign takes.
+**The clone is the durable entity.** IDs are minted once and carried forward. A clone stays traceable from growth plate through ELISA plate through rearray to sequencing tube, across as many physical plate changes as the campaign takes.
 
-**Extension happens through registries, not edits.** A new instrument format, a
-new hit-calling strategy, a new construct scaffold, or a new reagent rule is a
-new file plus a one-line registration. Existing code does not move.
+**Extension happens through registries, not edits.** A new instrument format, a new hit-calling strategy, a new construct scaffold, or a new reagent rule is a new file plus a one-line registration. Existing code does not move.
 
-**Formats are verified, never guessed.** Anything that parses or writes a file
-for an external system requires a real example of that format, committed as a
-fixture and documented, before the code is written. Guessed formats are how a
-tool like this quietly produces wrong results.
-
-## Install
-
-```bash
-git clone https://github.com/slbonanno/plateforge1-wet-dry-lab-workflow1.git
-cd plateforge
-python3 -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
-pytest
-```
-
-Data lives outside the repository:
-
-```bash
-export PLATEFORGE_DATA=~/plateforge-data
-```
+**Formats are verified, never guessed.** Anything that parses or writes a file for an external system requires a real example of that format, committed as a fixture and documented, before the code is written. Guessed formats are how a tool like this quietly produces wrong results.
 
 ## Layout
 
@@ -99,32 +81,6 @@ tests/
 - [ ] `assay`: review plots and interactive pick sessions
 - [ ] `reagents`: catalog, lot tracking, caveat rules
 - [ ] `emit`: liquid handler worklists, sequencing forms, run summaries
-
-## The sampler
-
-A discovery campaign does not yield ten interchangeable clones, so neither does
-this. Sequences are drawn across a germline panel by weight, spread across CDRH3
-length bins, and chosen greedily to maximise the minimum pairwise distance — then
-checked against explicit criteria rather than eyeballed.
-
-![Germline composition](docs/figures/fig1_germline_composition.png)
-
-The panel is data, so changing the mix is a config edit. Germline is also the
-only available handle on *behavioural* difference before real assay data exists,
-which is why the three scaffolds differ in CDRH3 length regime rather than all
-being well-behaved ones.
-
-![CDRH3 lengths](docs/figures/fig2_cdr3_lengths.png)
-
-The third figure is the one that matters: it is a visual acceptance test. Random
-draws of the same size reach much higher worst-pair identity, because a real pool
-is full of expanded clonal lineages. If the sampler regresses, this figure shows
-it immediately.
-
-![Identity check](docs/figures/fig3_identity_check.png)
-
-Reasoning and sources for the panel are in `decisions/0007`; the diversity
-criteria are in `decisions/0008`.
 
 ## Conventions worth knowing
 
