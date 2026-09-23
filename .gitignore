@@ -10,4 +10,6 @@ data/
 *.sqlite-wal
 *.sqlite-shm
 outputs/
+# generated figures only -- docs/figures/ is committed for the README
+/figures/
 .DS_Store

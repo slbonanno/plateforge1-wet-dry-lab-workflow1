@@ -32,6 +32,8 @@ def ingest(df: pd.DataFrame, meta: dict, produced_by: str = "library.oas") -> st
         cols = [c for c in oas.INDEX_COLUMNS if c in fresh.columns]
         rows = fresh[cols].copy()
         rows["has_liability"] = rows.get("has_liability", False).astype(int)
+        if "n_ambiguous" in rows.columns:
+            rows["n_ambiguous"] = rows["n_ambiguous"].fillna(0).astype(int)
         rows["meta_json"] = "{}"
         rows["notes"] = None
         rows["created_at"] = ids.now_iso()

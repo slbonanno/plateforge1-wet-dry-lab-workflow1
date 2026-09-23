@@ -43,6 +43,10 @@ A toolkit for antibody discovery workflows, built in independent modules:
 
 6. **Never write a file emitter without a real example file in `fixtures/`.**
    Format guesses are how this project fails. See `docs/formats/README.md`.
+   The same applies to readers: `docs/formats/oas.md` records what was checked
+   against a real shard and what is still assumed. When an external source is
+   unreachable, write down what was tried and what it returned — a future
+   session should not have to rediscover that OPIG serves 403.
 
 7. **Unanticipated fields go in `meta_json`, not a new column and not prose.**
    Query them with `json_extract`. When a key recurs enough to matter, promote
@@ -79,6 +83,13 @@ deliberately undecided.** Open questions belong there, not in code comments and
 not in someone's head. Read it when returning to the project after a gap. Do not
 resolve one silently — write the decision record.
 
+## README.md is author-maintained — do not edit it
+
+`README.md` belongs to the repository owner and is written by hand. Never edit
+it, and never include it in a patch. When a change alters what the project can
+do or how it is run, say so in the commit message and in the relevant module
+README under `src/plateforge/*/README.md`, which are fair game.
+
 ## Current state
 
 `core` and `library` are built and tested (38 tests). `assay`, `reagents` and
@@ -88,6 +99,11 @@ resolve one silently — write the decision record.
 is tested entirely against synthetic OAS-format units (`library.synth`), so the
 suite runs with no network and no downloaded data. A real OAS fixture is still
 outstanding (Q9).
+
+Generated figures go under `figures/` (gitignored), split into `synthetic/`
+and `real/`. Committed README figures live in `docs/figures/`. Never mix them:
+a synthetic figure presented as real is the most damaging mistake this repo
+can make.
 
 The next piece of work is `assay`: experiment definition from JSON, plate layout,
 and clone registration from a `LIB` id.

@@ -14,7 +14,38 @@ Sequence acquisition and in-silico construct generation.
 | `pool.py` | Persists the pool — parquet for full rows, SQLite for the filter index |
 | `diversity.py` | Diversity-aware sampling and the acceptance criteria |
 | `synth.py` | Synthetic OAS-format units for testing and dummy-data generation |
+| `hf.py` | Reads the HuggingFace parquet mirror; maps its `meta_*` columns back to an OAS metadata dict |
 | `figures.py` | Regenerable figures; figure 3 is a visual acceptance test |
+
+Two entry points:
+
+```bash
+python scripts/demo.py                                   # synthetic, offline
+python scripts/fetch_oas.py --list-studies               # what the mirror holds
+python scripts/fetch_oas.py --study "Briney et al., 2019"  # real sequences
+python scripts/fetch_oas.py --source ~/Downloads/unit.csv.gz   # a local unit
+```
+
+Real data comes from the HuggingFace parquet mirror of OAS, because OPIG's own
+download paths return 403 and OAS has no API. Install the extra for it:
+
+```bash
+pip install -e ".[hf]"
+```
+
+`docs/formats/oas.md` records what is blocked, what the mirror's schema looks
+like, and the gotchas found in real data.
+
+Generated figures go under `figures/`, which is gitignored and split so a
+synthetic figure is never mistaken for a real one:
+
+```
+figures/synthetic/   from demo.py
+figures/real/        from fetch_oas.py
+```
+
+Nothing under `figures/` is committed. Regenerate rather than checking one in —
+a stale figure that no longer matches the code is worse than no figure.
 
 ## The shape of a run
 
@@ -41,6 +72,48 @@ lib_id = pool.make_library("campaign-a", list(picked["seq_id"]),
 ```
 
 Downstream modules receive `lib_id`, never objects from this module.
+
+## Figures
+
+`figures.all_figures()` writes four; `alignment()` and `aa_legend()` are separate
+because the alignment needs one germline at a time.
+
+| Figure | Shows |
+|---|---|
+| 1 germline composition | pool vs sample vs panel target — did the sampler hit quota |
+| 2 CDRH3 lengths | per-germline length distributions, sampled members marked |
+| 3 identity check | sampler vs random draws; the visual acceptance test |
+| 4 V gene usage | what is actually in the pool, grouped by family |
+| 5 alignment | per-germline, every residue printed, only divergence from germline coloured, IMGT regions banded above |
+
+The alignment view works without running an aligner because OAS ships
+`sequence_alignment_aa` IMGT-gapped, so sequences from one germline are already
+column-aligned. `normalize()` keeps that as `aa_gapped` alongside the ungapped
+`aa_seq`, and keeps OAS's own `germline_alignment_aa` as `germline_aa`. Both
+live in parquet only, so fetch them with `pool.fetch(...)` rather than
+`pool.index()`.
+
+The reference row is **the germline**, taken from the `germline_alignment_aa`
+column OAS ships per sequence — IgBlast's own call, already column-aligned, so
+there is no germline table to maintain and nothing asserted that the data did
+not provide. `reference_row()` falls back to the observed consensus only when a
+data unit carries no germline column, and labels the row so a figure can never
+silently imply a germline it did not have.
+
+Every residue letter is printed. Positions matching the germline appear in
+muted ink with no fill; only substitutions get a coloured cell, so the sequence
+stays readable and divergence is what catches the eye. FR and CDR bands are
+drawn above from OAS's own per-region columns (`fwr1_aa`, `cdr1_aa`, ...),
+located by searching for each region in the sequence rather than trusting
+cumulative lengths, so overlapping or non-tiling regions degrade to "no band"
+instead of a wrong one.
+
+Residue colouring is one hue per amino acid, banded by property so families
+read as colour neighbourhoods. Twenty categories cannot be separated by colour
+alone — that is perception, not palette design — so hues were chosen by
+maximising the minimum pairwise OKLab distance under normal, deuteranopic and
+protanopic vision within each band (worst pair ≈5.0 ΔE), and the residue letter
+is drawn in every cell with ink picked per fill luminance.
 
 ## Storage
 

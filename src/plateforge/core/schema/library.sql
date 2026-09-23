@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS sequences (
     cdr3_aa       TEXT,
     cdr3_len      INTEGER,
     redundancy    INTEGER,
+    n_ambiguous   INTEGER DEFAULT 0,
     anarci_status TEXT,
     has_liability INTEGER DEFAULT 0,
     species       TEXT,

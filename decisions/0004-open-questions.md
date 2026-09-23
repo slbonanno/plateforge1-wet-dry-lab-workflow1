@@ -22,11 +22,15 @@ gets its own numbered decision record and is struck from this list.
 | Q6 | Paired-chain support | `library` scFv path | Unpaired heavy only; light chain fixed to IGKV1-39 (see 0007) |
 | Q7 | Reader format specifics for each instrument | `assay` ingest | Blocked on real export files; see docs/formats |
 | Q8 | Schema migrations for stores that already hold data | all modules | `CREATE TABLE IF NOT EXISTS` does not alter existing tables; fine while stores are disposable, needs a plan before real data accumulates |
-| Q9 | Real OAS fixture | `library` ingest | Tested only against synthetic units; see docs/formats/oas.md for what needs checking |
+| Q9 | Real OAS fixture | `library` ingest | Still none. Blocked on OPIG 403; the HuggingFace mirror is now the route. Capture a shard subset as a fixture on the first successful pull |
+| Q12 | Column-aligning ragged real sequences | `library` alignment figure | `sequence_alignment_aa` is not fixed-width: IGHV3-23 shows 54 distinct lengths over 16,497 sequences. `ANARCI_numbering` carries per-residue IMGT positions and is the proper fix |
+| Q11 | Paired-chain data | `library` scFv path | The mirror splits heavy and light into separate folders, so they are not paired. True paired units are a different layout and need their own adapter |
 
 ## Closed
 
-See numbered decision records 0001-0003, 0005-0008.
+See numbered decision records 0001-0003, 0005-0009.
+
+- **Q10** (which ANARCI flags are real liabilities) — closed by 0009.
 
 - **Q1** (diversity criteria) — closed by 0008.
 - **Q1a** (which germlines) — closed by 0007.
