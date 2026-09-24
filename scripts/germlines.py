@@ -19,7 +19,6 @@ import argparse
 import os
 import sys
 
-os.environ.setdefault("PLATEFORGE_DATA", os.path.expanduser("~/plateforge-data"))
 
 from plateforge.core import paths                                   # noqa: E402
 from plateforge.library import germline_db as gdb, germlines        # noqa: E402

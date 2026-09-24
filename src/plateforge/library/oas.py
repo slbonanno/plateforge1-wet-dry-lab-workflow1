@@ -121,6 +121,16 @@ class Filter:
     drop_duplicate_cdr3: bool = False
     max_ambiguous: int | None = 0   # X and other non-standard residues allowed
 
+    def as_dict(self) -> dict:
+        """Every knob, for a run manifest. dataclasses.asdict does not keep
+        the tuple readable once it has been through JSON."""
+        from dataclasses import fields
+        out = {}
+        for f in fields(self):
+            v = getattr(self, f.name)
+            out[f.name] = list(v) if isinstance(v, tuple) else v
+        return out
+
     def _steps(self):
         """(name, function) pairs, applied in order."""
         steps = []

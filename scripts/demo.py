@@ -71,10 +71,11 @@ def main() -> None:
 
     # The alignment view needs the gapped sequence, which lives in parquet.
     full = pool.fetch(list(idx["seq_id"]),
-                      columns=["seq_id", "v_gene", "aa_gapped", "germline_aa"]
+                      columns=["seq_id", "v_gene", "j_gene", "aa_gapped", "germline_aa"]
                               + oas.REGION_COLUMNS)
     busiest = idx["v_gene"].value_counts().index[0]
-    made.append(figures.alignment(full, busiest, out / f"fig5_alignment_{busiest}.png"))
+    made.extend(figures.alignments_per_gene(full, out, prefix="fig5_alignment",
+                                            max_rows=50).values())
     made.append(figures.aa_legend(out / "fig5b_aa_legend.png"))
 
     print("\nfigures:")

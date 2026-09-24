@@ -198,3 +198,65 @@ def sample(candidates: pd.DataFrame, n: int, panel: germlines.Panel | None = Non
     if unique_cdr3:
         out = out.drop_duplicates(subset=["cdr3_aa"])
     return out.reset_index(drop=True)
+
+
+def seriate(seqs: list[str]) -> list[int]:
+    """Order sequences so that neighbours are similar.
+
+    A greedy nearest-neighbour path: start from the sequence furthest from the
+    centroid (the most distinctive one, so the path runs from an edge inward
+    rather than starting in the middle and doubling back), then repeatedly
+    take whichever unused sequence is closest to the last one placed.
+
+    This is a heuristic, not an optimal ordering -- travelling-salesman
+    orderings are exact only for toy sizes and the point here is that adjacent
+    wells look alike, not that the total path is minimal. Ties break on index
+    so the result is the same on every machine and every run.
+    """
+    n = len(seqs)
+    if n < 3:
+        return list(range(n))
+    dist = [[0.0] * n for _ in range(n)]
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = distance(seqs[i], seqs[j])
+            dist[i][j] = dist[j][i] = d
+
+    start = max(range(n), key=lambda i: (sum(dist[i]) / n, -i))
+    order, used = [start], {start}
+    while len(order) < n:
+        last = order[-1]
+        nxt = min((i for i in range(n) if i not in used),
+                  key=lambda i: (dist[last][i], i))
+        order.append(nxt)
+        used.add(nxt)
+    return order
+
+
+def group_for_plate(picked: pd.DataFrame, by: str = "v_gene",
+                    sequence_column: str = "cdr3_aa") -> pd.DataFrame:
+    """Reorder picks so neighbouring wells hold similar clones.
+
+    Grouped by germline first -- two clones on different scaffolds are not
+    neighbours in any useful sense -- with the largest group first, and
+    seriated on CDRH3 distance within each group.
+
+    This is purely a layout convenience: it changes which well a clone sits
+    in, never which clones were chosen. The diversity of the set is decided by
+    the sampler and is unaffected.
+    """
+    if not len(picked):
+        return picked
+    frame = picked.reset_index(drop=True)
+    if by in frame.columns:
+        sizes = frame[by].value_counts()
+        groups = [frame[frame[by] == g] for g in sizes.index]
+    else:
+        groups = [frame]
+
+    out = []
+    for group in groups:
+        seqs = [str(s) for s in group[sequence_column]]
+        order = seriate(seqs)
+        out.append(group.iloc[order])
+    return pd.concat(out, ignore_index=True)

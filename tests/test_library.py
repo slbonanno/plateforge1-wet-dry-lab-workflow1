@@ -1,6 +1,8 @@
 import os
 
 import pandas as pd
+import re
+
 import pytest
 
 from plateforge.core import artifacts, stores
@@ -548,15 +550,42 @@ def test_mirror_rows_normalize_like_a_data_unit(tmp_path):
         assert df[col].notna().all()
 
 
-def test_alignment_report_detects_ragged(tmp_path):
+def test_alignment_report_counts_raw_length_spread(tmp_path):
     from plateforge.library import hf
     df = pd.DataFrame({
         "v_gene": ["IGHV3-23"] * 3 + ["IGHV1-69"] * 2,
         "aa_gapped": ["AAAA", "AAAA", "AAA", "BBBB", "BBBB"],
     })
     rep = hf.alignment_report(df).set_index("v_gene")
-    assert not rep.loc["IGHV3-23", "column_aligned"]
-    assert rep.loc["IGHV1-69", "column_aligned"]
+    assert rep.loc["IGHV3-23", "raw_lengths"] == 2
+    assert rep.loc["IGHV1-69", "raw_lengths"] == 1
+
+
+def test_ragged_lengths_do_not_block_alignment(tmp_path):
+    """raw_lengths being high is expected on real data and does not stop the
+    figure: it aligns on IMGT numbering, not string position."""
+    from plateforge.library import hf
+    df = pd.DataFrame({
+        "v_gene": ["IGHV3-23"] * 3,
+        "aa_gapped": ["QVQLVES", "VQLVES", "QLVES"],      # three lengths
+        "anarci_numbering": [REAL_NUMBERING] * 3,
+    })
+    rep = hf.alignment_report(df).set_index("v_gene")
+    assert rep.loc["IGHV3-23", "raw_lengths"] == 3
+    assert rep.loc["IGHV3-23", "numbered"] == 3
+    assert rep.loc["IGHV3-23", "can_align"], "numbering is what decides"
+
+
+def test_report_flags_missing_numbering(tmp_path):
+    from plateforge.library import hf
+    df = pd.DataFrame({
+        "v_gene": ["IGHV3-23"] * 3,
+        "aa_gapped": ["QVQLVES"] * 3,
+        "anarci_numbering": [None, None, None],
+    })
+    rep = hf.alignment_report(df).set_index("v_gene")
+    assert rep.loc["IGHV3-23", "numbered"] == 0
+    assert not rep.loc["IGHV3-23", "can_align"]
 
 
 def test_hf_missing_dependency_message(monkeypatch):
@@ -574,24 +603,32 @@ def test_hf_missing_dependency_message(monkeypatch):
         hf._require_hf()
 
 
-# --- alignment refuses to misalign ----------------------------------------
+# --- alignment keeps ragged reads instead of excluding them ----------------
 
-def test_alignment_excludes_ragged_sequences(tmp_path, monkeypatch):
+def test_alignment_keeps_ragged_sequences(tmp_path, monkeypatch):
+    """A short read is aligned with gaps, not dropped.
+
+    The old renderer restricted to the modal string length, which threw away
+    exactly the 5' truncated reads that dominate real OAS data.
+    """
     _fresh(tmp_path, monkeypatch)
     from plateforge.library import figures
     src = synth.make_unit(tmp_path / "unit.csv.gz", n=300, seed=50)
     df, _ = oas.load(src)
     gene = df["v_gene"].value_counts().index[0]
     sub = df[df["v_gene"] == gene].copy()
-    # Truncate a few reads, as a partial-coverage read would be.
     idx = sub.index[:3]
-    sub.loc[idx, "aa_gapped"] = sub.loc[idx, "aa_gapped"].str[:-7]
+    sub.loc[idx, "aa_gapped"] = sub.loc[idx, "aa_gapped"].str[7:]      # 5' truncated
+
+    m, _rows = figures.build_msa(sub, gene, max_rows=12)
+    assert m.n_sequences == min(12, len(sub)), "no sequence may be excluded"
+    truncated = set(str(s) for s in sub.loc[idx, "seq_id"])
+    drawn = set(m.labels)
+    assert truncated & drawn, "the truncated reads must be in the alignment"
 
     p = figures.alignment(sub, gene, tmp_path / "ragged.png", max_rows=12)
     assert p.exists() and p.stat().st_size > 5_000
-    q = figures.alignment(sub, gene, tmp_path / "padded.png", max_rows=12,
-                          allow_ragged=True)
-    assert q.exists() and q.stat().st_size > 5_000
+    assert p.with_suffix(".fasta").exists(), "the alignment is also written as FASTA"
     stores.close_all()
 
 
@@ -946,7 +983,12 @@ def test_resolve_prefers_fasta_over_pool(tmp_path, monkeypatch):
     path = tmp_path / "imgt.fasta"
     path.write_text(IMGT_FASTA)
 
-    assert gdb.resolve("IGHV3-23", fasta_path=path).source == "fasta"
+    # The bundled IMGT tables outrank everything by default, when present.
+    if gdb.anarci_available():
+        assert gdb.resolve("IGHV3-23").source == "anarci"
+    # Order is explicit when a caller wants a specific provenance.
+    assert gdb.resolve("IGHV3-23", order=("fasta", "pool"),
+                       fasta_path=path).source == "fasta"
     assert gdb.resolve("IGHV3-23", order=("pool",)).source == "pool"
     stores.close_all()
 
@@ -992,6 +1034,7 @@ def test_coverage_report_flags_derived(tmp_path, monkeypatch):
     path.write_text(IMGT_FASTA)
 
     rep = gdb.coverage_report(["IGHV3-23", "IGHV1-69", "IGHV0-00"],
+                              order=("fasta", "pool"),
                               fasta_path=path).set_index("gene")
     assert rep.loc["IGHV3-23", "source"] == "fasta"
     assert rep.loc["IGHV1-69", "source"] == "pool"       # not in the fixture
@@ -1047,3 +1090,1323 @@ def test_plate_sized_pick_is_duplicate_free(tmp_path, monkeypatch):
     assert report["max_pairwise_identity"]["value"] < 1.0
     assert report["pass"], report
     stores.close_all()
+
+
+# --- alignment presentation ------------------------------------------------
+
+def test_germline_numbering_skips_gaps():
+    """A gap column is a position some other sequence has and the germline
+    does not, so it must not consume a germline residue number."""
+    from plateforge.library import imgt
+    cols = ["1 ", "2 ", "111A", "3 "]
+    ref = {"1 ": "Q", "2 ": "V", "3 ": "L"}          # nothing at 111A
+    numbers = []
+    k = 0
+    for c in cols:
+        aa = ref.get(c)
+        if isinstance(aa, str) and aa.strip():
+            k += 1
+            numbers.append(k)
+        else:
+            numbers.append(None)      # a gap is not a germline position
+    assert numbers == [1, 2, None, 3]
+    assert max(n for n in numbers if n) == 3, "three germline residues, not four"
+    assert imgt.position_key("111A") > imgt.position_key("2 ")
+
+
+def test_alignment_renders_with_ragged_coverage(tmp_path, monkeypatch):
+    _fresh(tmp_path, monkeypatch)
+    from plateforge.library import figures, imgt
+    src = synth.make_unit(tmp_path / "unit.csv.gz", n=800, seed=96)
+    df, _ = oas.load(src, oas.Filter(cdr3_len_range=(8, 30)))
+    gene = df["v_gene"].value_counts().index[0]
+    sub = df[df["v_gene"] == gene].head(10).copy()
+
+    rows = []
+    for i, (_, row) in enumerate(sub.iterrows()):
+        numbering = imgt.parse(row["anarci_numbering"])
+        if i % 2:
+            numbering["fwh1"] = {k: v for k, v in numbering["fwh1"].items()
+                                 if int(str(k).strip().rstrip("ABCDEFG") or 0) > 10}
+        row = row.copy()
+        row["anarci_numbering"] = repr(numbering)
+        rows.append(row)
+    ragged = pd.DataFrame(rows)
+
+    aln = imgt.build(ragged)
+    assert aln.matrix.isna().any().any(), "truncated reads must leave gaps"
+    p = figures.alignment(ragged, gene, tmp_path / "ragged.png", max_rows=10)
+    assert p.exists() and p.stat().st_size > 5_000
+    stores.close_all()
+
+
+def test_summary_panel_renders(tmp_path, monkeypatch):
+    _fresh(tmp_path, monkeypatch)
+    from plateforge.library import figures
+    src = synth.make_unit(tmp_path / "unit.csv.gz", n=3000, seed=97)
+    df, meta = oas.load(src, oas.Filter(cdr3_len_range=(8, 30)))
+    pool.ingest(df, meta)
+    idx = pool.index()
+    picked = diversity.sample(idx, 24, seed=1)
+    full = pool.fetch(list(picked["seq_id"]),
+                      columns=["seq_id", "v_gene", "aa_gapped", "germline_aa",
+                               "anarci_numbering"])
+    p = figures.summary_panel(idx, picked, full, out=tmp_path / "summary.png")
+    assert p.exists() and p.stat().st_size > 20_000
+    stores.close_all()
+
+
+def test_summary_panel_without_alignment(tmp_path, monkeypatch):
+    _fresh(tmp_path, monkeypatch)
+    from plateforge.library import figures
+    src = synth.make_unit(tmp_path / "unit.csv.gz", n=2000, seed=98)
+    df, meta = oas.load(src, oas.Filter(cdr3_len_range=(8, 30)))
+    pool.ingest(df, meta)
+    idx = pool.index()
+    picked = diversity.sample(idx, 12, seed=1)
+    p = figures.summary_panel(idx, picked, None, out=tmp_path / "bars.png")
+    assert p.exists() and p.stat().st_size > 10_000
+    stores.close_all()
+
+
+# --- parquet schema drift --------------------------------------------------
+
+def test_stale_pool_is_detected(tmp_path, monkeypatch):
+    """seq_id is a content hash, so re-ingest skips known rows -- which means a
+    pool written by older code never gains a column added since, silently."""
+    _fresh(tmp_path, monkeypatch)
+    src = synth.make_unit(tmp_path / "unit.csv.gz", n=800, seed=99)
+    df, meta = oas.load(src, oas.Filter(cdr3_len_range=(8, 30)))
+    pool.ingest(df.drop(columns=["anarci_numbering"]), meta)
+    assert "anarci_numbering" in pool.schema_drift()
+    stores.close_all()
+
+
+def test_plain_reingest_does_not_repair_drift(tmp_path, monkeypatch):
+    _fresh(tmp_path, monkeypatch)
+    from plateforge.core import artifacts
+    src = synth.make_unit(tmp_path / "unit.csv.gz", n=800, seed=100)
+    df, meta = oas.load(src, oas.Filter(cdr3_len_range=(8, 30)))
+    pool.ingest(df.drop(columns=["anarci_numbering"]), meta)
+    run = pool.ingest(df, meta)                      # no refresh
+    assert artifacts.get(run).meta["rows_added"] == 0
+    assert "anarci_numbering" in pool.schema_drift()
+    stores.close_all()
+
+
+def test_refresh_backfills_and_does_not_duplicate(tmp_path, monkeypatch):
+    _fresh(tmp_path, monkeypatch)
+    src = synth.make_unit(tmp_path / "unit.csv.gz", n=800, seed=101)
+    df, meta = oas.load(src, oas.Filter(cdr3_len_range=(8, 30)))
+    pool.ingest(df.drop(columns=["anarci_numbering"]), meta)
+    before = len(pool.index())
+
+    pool.ingest(df, meta, refresh=True)
+    assert pool.schema_drift() == []
+    assert len(pool.index()) == before, "refresh must replace, not duplicate"
+    assert pool.consistency()["consistent"]
+    stores.close_all()
+
+
+def test_alignment_builds_after_refresh(tmp_path, monkeypatch):
+    _fresh(tmp_path, monkeypatch)
+    from plateforge.library import imgt
+    src = synth.make_unit(tmp_path / "unit.csv.gz", n=1200, seed=102)
+    df, meta = oas.load(src, oas.Filter(cdr3_len_range=(8, 30)))
+    pool.ingest(df.drop(columns=["anarci_numbering"]), meta)
+
+    idx = pool.index()
+    gene = idx["v_gene"].value_counts().index[0]
+    cols = ["seq_id", "v_gene", "aa_gapped", "germline_aa"]
+    stale = pool.fetch(list(idx["seq_id"]), columns=cols)
+    assert imgt.build(stale[stale["v_gene"] == gene].head(10)) is None
+
+    pool.ingest(df, meta, refresh=True)
+    fresh = pool.fetch(list(pool.index()["seq_id"]), columns=cols + ["anarci_numbering"])
+    assert imgt.build(fresh[fresh["v_gene"] == gene].head(10)) is not None
+    stores.close_all()
+
+
+def test_summary_panel_says_why_it_is_empty(tmp_path, monkeypatch):
+    """An empty panel of bare axes is indistinguishable from a broken figure."""
+    _fresh(tmp_path, monkeypatch)
+    from plateforge.library import figures
+    src = synth.make_unit(tmp_path / "unit.csv.gz", n=1200, seed=103)
+    df, meta = oas.load(src, oas.Filter(cdr3_len_range=(8, 30)))
+    pool.ingest(df.drop(columns=["anarci_numbering"]), meta)
+    idx = pool.index()
+    picked = diversity.sample(idx, 12, seed=1)
+    stale = pool.fetch(list(idx["seq_id"]),
+                       columns=["seq_id", "v_gene", "aa_gapped", "germline_aa"])
+    p = figures.summary_panel(idx, picked, stale, out=tmp_path / "empty.png")
+    assert p.exists() and p.stat().st_size > 10_000
+    stores.close_all()
+
+
+def test_panel_uses_rows_that_have_numbering_not_merely_the_first(tmp_path, monkeypatch):
+    """A pool ingested across versions has its oldest rows first, and those
+    are the ones written before anarci_numbering existed. Taking head(n)
+    selected exactly the unusable rows and the panel rendered blank."""
+    _fresh(tmp_path, monkeypatch)
+    from plateforge.library import figures, imgt
+    src = synth.make_unit(tmp_path / "unit.csv.gz", n=2400, seed=104)
+    df, meta = oas.load(src, oas.Filter(cdr3_len_range=(8, 30)))
+    half = len(df) // 2
+    pool.ingest(df.iloc[:half].drop(columns=["anarci_numbering"]), meta)
+    pool.ingest(df.iloc[half:], meta)
+
+    idx = pool.index()
+    gene = idx["v_gene"].value_counts().index[0]
+    full = pool.fetch(list(idx["seq_id"]),
+                      columns=["seq_id", "v_gene", "aa_gapped", "germline_aa",
+                               "anarci_numbering"])
+    sub = full[full["v_gene"] == gene]
+    assert sub["anarci_numbering"].head(10).isna().all(), "setup: stale rows come first"
+    assert sub["anarci_numbering"].notna().any(), "setup: some rows are usable"
+
+    # The alignment needs a germline, not numbering, so stale rows are fine.
+    m, _rows = figures.build_msa(sub, gene, max_rows=20)
+    assert m is not None, "must not give up because the first rows are stale"
+    assert m.n_sequences > 0
+
+    picked = diversity.sample(idx, 12, seed=1)
+    p = figures.summary_panel(idx, picked, full, gene=gene, out=tmp_path / "mixed.png")
+    assert p.exists() and p.stat().st_size > 30_000
+    stores.close_all()
+
+
+# --- the alignment itself ---------------------------------------------------
+
+GERM = ("EVQLLESGGGLVQPGGSLRLSCAASGFTFSSYAMSWVRQAPGKGLEWVSAISGSGGSTYYADSVKG"
+        "RFTISRDNSKNTLYLQMNSLRAEDTAVYYCAKWGQGTLVTVSS")
+
+
+def test_msa_numbers_only_the_germline():
+    """Germline residues are numbered 1..L. Nothing else is numbered at all."""
+    from plateforge.library import msa
+
+    m = msa.build(GERM, {"a": GERM, "b": GERM[:40] + "WWW" + GERM[40:]})
+    numbered = [n for n in m.numbers if n is not None]
+    assert numbered == list(range(1, len(GERM) + 1)), \
+        "every germline residue owns exactly one column, in order"
+    assert m.numbers.count(None) == 3, "the 3 inserted columns are not positions"
+    # and the reference is the only row the numbering describes
+    assert len(m.ref) == m.width and all(len(r) == m.width for r in m.rows)
+
+
+def test_insertion_opens_a_gap_in_every_other_row():
+    from plateforge.library import msa
+
+    with_insert = GERM[:40] + "PQR" + GERM[40:]
+    m = msa.build(GERM, {"plain": GERM, "longer": with_insert})
+    cols = [i for i, n in enumerate(m.numbers) if n is None]
+    assert cols, "an insertion must open columns"
+    plain = m.rows[m.labels.index("plain")]
+    assert all(plain[c] == "-" for c in cols)
+    assert "".join(m.rows[m.labels.index("longer")][c] for c in cols) == "PQR"
+    assert all(m.ref[c] == "-" for c in cols), "the germline has no residue there"
+
+
+def test_truncated_read_aligns_with_leading_gaps():
+    """A 5' truncated read keeps register instead of sliding left."""
+    from plateforge.library import msa
+
+    m = msa.build(GERM, {"short": GERM[15:]})
+    row = m.rows[0]
+    assert row[:15] == "-" * 15
+    assert row[15:] == m.ref[15:]
+    assert m.identity(row) < 1.0, "the missing span counts against identity"
+
+
+def test_differences_are_reported_in_germline_numbering():
+    from plateforge.library import msa
+
+    mutant = GERM[:4] + "V" + GERM[5:]
+    m = msa.build(GERM, {"m": mutant})
+    assert m.differences(m.rows[0]) == [(5, GERM[4], "V")]
+
+
+def test_reference_comes_from_the_oas_germlines(tmp_path, monkeypatch):
+    """The reference is reconstructed from OAS's own germline calls, and says so."""
+    _fresh(tmp_path, monkeypatch)
+    from plateforge.library import msa
+
+    src = synth.make_unit(tmp_path / "unit.csv.gz", n=200, seed=71)
+    df, _ = oas.load(src)
+    gene = df["v_gene"].value_counts().index[0]
+    # use_imgt=False is the fallback path: no IMGT tables, reconstruct from
+    # what OAS itself reported for these reads.
+    seq, label = msa.reference_for(df, gene, use_imgt=False)
+    assert seq and "OAS germline consensus" in label
+    assert "-" not in seq and "." not in seq, "the reference is ungapped"
+
+
+def test_consensus_reference_takes_the_longest_span():
+    from plateforge.library import msa
+
+    seq, n = msa.consensus_reference(["QLLESGGGLVQPGG", "EVQLLESGGGLVQPGG"])
+    assert seq == "EVQLLESGGGLVQPGG" and n == 2
+
+
+def test_unknown_backend_is_an_error_not_a_silent_fallback():
+    from plateforge.library import msa
+
+    with pytest.raises(KeyError, match="unknown backend"):
+        msa.build(GERM, {"a": GERM}, backend="nope")
+
+
+def test_reference_backend_is_always_available():
+    from plateforge.library import msa
+
+    assert "reference" in msa.available_backends()
+
+
+# --- the run bundle ---------------------------------------------------------
+
+def _selection_fixture(tmp_path, monkeypatch, n=300, pick=24, seed=80):
+    _fresh(tmp_path, monkeypatch)
+    src = synth.make_unit(tmp_path / "unit.csv.gz", n=n, seed=seed)
+    filt = oas.Filter(chain="H", cdr3_len_range=(8, 30))
+    df, meta = oas.load(src, filt)
+    pool.ingest(df, meta)
+    idx = pool.index()
+    full = pool.fetch(list(idx["seq_id"]),
+                      columns=["seq_id", "v_gene", "aa_gapped", "germline_aa"]
+                              + oas.REGION_COLUMNS)
+    picked = diversity.sample(idx, pick, seed=seed)
+    rows = full[full["seq_id"].isin(set(picked["seq_id"]))]
+    lib_id = pool.make_library("t", list(picked["seq_id"]), produced_by="test")
+    return idx, picked, rows, meta, filt, lib_id
+
+
+def test_selection_run_writes_one_alignment_per_gene(tmp_path, monkeypatch):
+    import json
+    from plateforge.library import selection
+
+    idx, picked, rows, meta, filt, lib_id = _selection_fixture(tmp_path, monkeypatch)
+    b = selection.run(lib_id=lib_id, pool_index=idx, picked=picked,
+                      alignment_rows=rows, meta=meta, n_requested=24, seed=80,
+                      filter_spec=filt, funnel=meta.get("_funnel"),
+                      max_alignment_rows=20)
+    genes = set(picked["v_gene"])
+    for gene in genes:
+        assert (b.dir / f"alignment_{gene}.png").exists()
+        assert (b.dir / f"alignment_{gene}.fasta").exists()
+
+    man = json.loads((b.dir / "manifest.json").read_text())
+    assert set(man["sections"]["alignments"]) == genes
+    stores.close_all()
+
+
+def test_manifest_records_how_the_sequences_were_obtained(tmp_path, monkeypatch):
+    """The bundle has to answer 'why these and not others' without the terminal."""
+    import json
+    from plateforge.library import selection
+
+    idx, picked, rows, meta, filt, lib_id = _selection_fixture(tmp_path, monkeypatch)
+    b = selection.run(lib_id=lib_id, pool_index=idx, picked=picked,
+                      alignment_rows=rows, meta=meta, n_requested=24, seed=80,
+                      filter_spec=filt, funnel=meta.get("_funnel"),
+                      diversity_report=diversity.Spec(min_genes=1).check(picked),
+                      max_alignment_rows=20)
+    man = json.loads((b.dir / "manifest.json").read_text())
+    s = man["sections"]
+    assert s["source"]["ref"] == meta["_source_ref"]
+    assert s["source"]["scanned"] == meta["_rows_scanned"]
+    assert s["filter"]["cdr3_len_range"] == [8, 30]
+    assert s["filter"]["funnel"][0]["step"] == "input"
+    assert s["selection"]["seed"] == 80
+    assert s["selection"]["n_requested"] == 24
+    assert s["selection"]["n_selected"] == len(picked)
+    assert man["code_version"]
+    assert (b.dir / "selected.csv").exists()
+    stores.close_all()
+
+
+def test_selected_csv_matches_the_library(tmp_path, monkeypatch):
+    import pandas as pd
+    from plateforge.library import selection
+
+    idx, picked, rows, meta, filt, lib_id = _selection_fixture(tmp_path, monkeypatch)
+    b = selection.run(lib_id=lib_id, pool_index=idx, picked=picked,
+                      alignment_rows=rows, meta=meta, n_requested=24, seed=80,
+                      max_alignment_rows=20)
+    got = pd.read_csv(b.dir / "selected.csv")
+    assert list(got["seq_id"]) == list(picked["seq_id"])
+    stores.close_all()
+
+
+def test_bundle_describes_itself(tmp_path, monkeypatch):
+    from plateforge.core import runs
+    from plateforge.library import selection
+
+    idx, picked, rows, meta, filt, lib_id = _selection_fixture(tmp_path, monkeypatch)
+    selection.run(lib_id=lib_id, pool_index=idx, picked=picked,
+                  alignment_rows=rows, meta=meta, n_requested=24, seed=80,
+                  max_alignment_rows=20)
+    text = runs.describe(lib_id)
+    assert lib_id in text and "seed 80" in text
+    stores.close_all()
+
+
+# --- colour means "differs from germline", and nothing else ----------------
+
+def _cells(ax, y):
+    """Filled cells on one row of a drawn alignment, as (column, facecolor)."""
+    import matplotlib.colors as mcolors
+    out = []
+    for patch in ax.patches:
+        bbox = patch.get_bbox()
+        if abs(bbox.y0 - y) < 1e-6:
+            out.append((int(round(bbox.x0)),
+                        mcolors.to_hex(patch.get_facecolor())))
+    return out
+
+
+def test_germline_row_is_never_filled():
+    """The reference is grey letters on white. A fill always means divergence."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from plateforge.library import figures, msa
+
+    mutant = GERM[:4] + "V" + GERM[5:]
+    m = msa.build(GERM, {"a": mutant, "b": GERM[:40] + "PQR" + GERM[40:]})
+    fig, ax = plt.subplots()
+    figures.draw_msa(ax, m, show_letters=False)
+    germline_fills = {c for _, c in _cells(ax, m.n_sequences)}
+    plt.close(fig)
+    assert germline_fills <= {figures.GAP_COLOR}, \
+        "only insertion columns may be tinted on the germline row"
+    assert not (germline_fills & set(figures.AA_COLOR.values()))
+
+
+def test_a_substitution_is_filled_and_a_match_is_not():
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from plateforge.library import figures, msa
+
+    mutant = GERM[:4] + "V" + GERM[5:]
+    m = msa.build(GERM, {"a": mutant})
+    fig, ax = plt.subplots()
+    figures.draw_msa(ax, m, show_letters=False)
+    filled = [c for c, colour in _cells(ax, m.n_sequences - 1)
+              if colour in set(figures.AA_COLOR.values())]
+    plt.close(fig)
+    assert filled == [4], "exactly the one changed position is coloured"
+
+
+def test_an_insertion_is_highlighted_in_the_variant():
+    """An inserted residue has nothing above it, and is still a divergence."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from plateforge.library import figures, msa
+
+    m = msa.build(GERM, {"ins": GERM[:40] + "PQR" + GERM[40:]})
+    insert_cols = [i for i, n in enumerate(m.numbers) if n is None]
+    fig, ax = plt.subplots()
+    figures.draw_msa(ax, m, show_letters=False)
+    filled = {c for c, colour in _cells(ax, m.n_sequences - 1)
+              if colour in set(figures.AA_COLOR.values())}
+    plt.close(fig)
+    assert set(insert_cols) <= filled, "inserted residues must be coloured"
+
+
+# --- the README block -------------------------------------------------------
+
+def test_run_writes_a_readme_block_naming_its_own_files(tmp_path, monkeypatch):
+    from plateforge.library import selection
+
+    idx, picked, rows, meta, filt, lib_id = _selection_fixture(tmp_path, monkeypatch)
+    b = selection.run(lib_id=lib_id, pool_index=idx, picked=picked,
+                      alignment_rows=rows, meta=meta, n_requested=24, seed=80,
+                      filter_spec=filt, funnel=meta.get("_funnel"),
+                      max_alignment_rows=20)
+    text = (b.dir / "summary.md").read_text()
+    assert lib_id in text, "the block must point at this run, not a generic path"
+    for name in ("manifest.json", "selected.csv", "filter_funnel.csv",
+                 "clones.csv", "plate_map.csv"):
+        assert name in text
+    assert "seed 80" in text
+    assert str(len(picked)) in text
+    stores.close_all()
+
+
+def test_readme_block_does_not_claim_the_mirror_for_a_local_file(tmp_path,
+                                                                 monkeypatch):
+    """A local unit is not the HuggingFace mirror, and must not say it is."""
+    from plateforge.library import selection
+
+    idx, picked, rows, meta, filt, lib_id = _selection_fixture(tmp_path, monkeypatch)
+    meta = dict(meta, _source_kind="local file")
+    b = selection.run(lib_id=lib_id, pool_index=idx, picked=picked,
+                      alignment_rows=rows, meta=meta, n_requested=24, seed=80,
+                      max_alignment_rows=20)
+    text = (b.dir / "summary.md").read_text()
+    assert "HuggingFace" not in text and "local data unit" in text
+    stores.close_all()
+
+
+# --- the vector, and what it already carries -------------------------------
+
+def test_vector_parts_translate_to_what_they_claim():
+    """The frozen DNA constants must encode the proteins named beside them."""
+    from plateforge.library import codon, vector
+
+    for dna, aa in [(vector.SIGNAL_DNA, vector.SIGNAL_AA),
+                    (vector.LINKER_G4S3_DNA, vector.LINKER_G4S3_AA),
+                    (vector.VL_DNA, vector.VL_AA),
+                    (vector.HIS6_DNA, vector.HIS6_AA)]:
+        assert codon.translate(dna) == aa
+
+
+def test_light_chain_is_the_imgt_germline_plus_a_named_junction():
+    """The VL must be traceable to IMGT, junction residues called out."""
+    from plateforge.library import germline_db, vector
+
+    if not germline_db.anarci_available():
+        pytest.skip("anarci not installed; install the [imgt] extra")
+    v = germline_db.from_anarci(vector.VL_V_GENE)
+    j = germline_db.from_anarci(vector.VL_J_GENE)
+    assert v and j, "the bundled IMGT tables must carry both"
+    assert vector.VL_AA == v.sequence + vector.VL_JUNCTION + j.sequence
+    assert vector.VL_JUNCTION not in (v.sequence, j.sequence)
+
+
+def test_assembled_orf_is_in_frame_and_makes_the_designed_protein():
+    from plateforge.library import codon, vector
+
+    vec = vector.get("pcdna-scfv-vk-v1")
+    vh = "EVQLLESGGGLVQPGGSLRLSCAASGFTFSSYAMSWVRQAPGKGLEWVSAKGGYFDYWGQGTLVTVSS"
+    dna = codon.optimize(vh, enzymes=("BsaI",)).dna
+    orf = vec.orf(dna)
+    assert len(orf) % 3 == 0
+    protein = codon.translate(orf)
+    assert protein.endswith("*") and protein.count("*") == 1
+    assert protein.startswith(vector.SIGNAL_AA)
+    assert vh in protein
+    assert vector.LINKER_G4S3_AA in protein and vector.VL_AA in protein
+
+
+def test_fusion_sites_are_constant_across_germlines():
+    """The whole point: one vector accepts every insert."""
+    from plateforge.library import vector
+
+    vec = vector.get("pcdna-scfv-vk-v1")
+    five, three = vec.fusion_sites()
+    assert len(five) == len(three) == 4
+    assert not vec.check_fusion_sites(), "the declared sites must be usable"
+    # They come from the flanks, so they cannot depend on the insert at all.
+    assert five == vec.upstream_dna()[-4:]
+    assert three == vec.downstream_dna()[:4]
+
+
+# --- the fragment -----------------------------------------------------------
+
+def _cds(aa="EVQLLESGGGLVQPGGSLRLSCAASGFTFSSYAMSWVRQAPGKGLEWVSAKGGYFDYWGQGTLVTVSS"):
+    from plateforge.library import codon
+    return codon.optimize(aa, enzymes=("BsaI",)).dna, aa
+
+
+def test_golden_gate_puts_the_enzyme_outside_and_the_overhangs_inside():
+    from plateforge.library import cloning, codon, vector
+
+    vec = vector.get("pcdna-scfv-vk-v1")
+    cds, _aa = _cds()
+    f = cloning.design(cds, vec, "golden_gate", min_length=300)
+    site = codon.sites_to_avoid(("BsaI",))[0]
+    assert f.dna.count(site) == 1 and f.dna.count(codon.reverse_complement(site)) == 1
+    five, three = vec.fusion_sites()
+    assert f.part("5' fusion site") == five
+    assert f.part("3' fusion site") == three
+    assert f.part("CDS") == cds
+    assert f.dna.index(site) < f.dna.index(five)      # enzyme outside the site
+    assert not f.warnings
+
+
+def test_short_fragments_are_padded_to_the_vendor_minimum():
+    from plateforge.library import cloning, vector
+
+    vec = vector.get("pcdna-scfv-vk-v1")
+    cds, _ = _cds("EVQLLESGGGLVQPGGSLRLSCAAS")          # deliberately tiny
+    f = cloning.design(cds, vec, "golden_gate", min_length=300)
+    assert f.length >= 300
+    assert f.part("CDS") == cds, "padding must not touch the coding sequence"
+
+
+def test_blunt_fragments_refuse_to_look_cloneable():
+    from plateforge.library import cloning, vector
+
+    vec = vector.get("pcdna-scfv-vk-v1")
+    cds, _ = _cds()
+    f = cloning.design(cds, vec, "blunt")
+    assert f.cloneable is False and f.warnings
+
+
+def test_verify_catches_a_frameshifted_insert():
+    """The expensive failure: fine alone, wrong once it is in the vector."""
+    from plateforge.library import cloning, vector
+
+    vec = vector.get("pcdna-scfv-vk-v1")
+    cds, aa = _cds()
+    good = cloning.design(cds, vec, "golden_gate", min_length=300)
+    assert cloning.verify(good, cds, vec, expected_protein=aa) == []
+
+    shifted = cds[:-1]
+    bad = cloning.design(shifted, vec, "golden_gate", min_length=300)
+    problems = cloning.verify(bad, shifted, vec, expected_protein=aa)
+    assert problems, "a 1-nt truncation must not pass"
+
+
+def test_filler_carries_no_type_iis_sites():
+    from plateforge.library import cloning, codon
+
+    for site in codon.sites_to_avoid(("BsaI", "BsmBI", "BbsI")):
+        assert site not in cloning.FILLER
+
+
+# --- the order --------------------------------------------------------------
+
+def test_design_separates_what_is_ordered_from_what_is_expressed(tmp_path,
+                                                                 monkeypatch):
+    from plateforge.library import ordering
+
+    idx, picked, _rows, _meta, _filt, _lib = _selection_fixture(
+        tmp_path, monkeypatch, pick=8)
+    clones = ordering.design(picked, min_order_length=300)
+    for _, row in clones.iterrows():
+        assert row["insert_aa_seq"] in row["clone_aa_seq"]
+        assert len(row["clone_aa_seq"]) > len(row["insert_aa_seq"]), \
+            "the vector adds leader, linker, VL and tag"
+        assert row["insert_dna_seq"] in row["order_dna_seq"]
+        assert row["order_length"] >= 300
+        assert row["assembly_problems"] is None
+    stores.close_all()
+
+
+def test_plate_is_sequential_and_neighbours_are_similar(tmp_path, monkeypatch):
+    from plateforge.library import diversity, ordering
+
+    idx, picked, _rows, _meta, _filt, _lib = _selection_fixture(
+        tmp_path, monkeypatch, n=600, pick=24)
+    grouped = ordering.design(picked, min_order_length=300)
+    scattered = ordering.design(picked, min_order_length=300,
+                                group_by_similarity=False)
+
+    assert list(grouped["well"])[:3] == ["A01", "B01", "C01"], "column-major"
+    assert set(grouped["seq_id"]) == set(scattered["seq_id"]), \
+        "layout must not change which clones were chosen"
+
+    def neighbour_distance(frame):
+        seqs = [str(s) for s in frame["cdr3_aa"]]
+        return sum(diversity.distance(a, b)
+                   for a, b in zip(seqs, seqs[1:])) / max(1, len(seqs) - 1)
+
+    assert neighbour_distance(grouped) < neighbour_distance(scattered)
+    stores.close_all()
+
+
+def test_unverified_vendor_layout_is_not_emitted_by_accident(tmp_path,
+                                                             monkeypatch):
+    from plateforge.library import ordering, vendors
+
+    idx, picked, _rows, _meta, _filt, _lib = _selection_fixture(
+        tmp_path, monkeypatch, pick=6)
+    clones = ordering.design(picked, min_order_length=300)
+
+    with pytest.raises(ValueError, match="no real upload template"):
+        vendors.emit(clones, "idt_eblocks")
+
+    order = vendors.emit(clones, "idt_eblocks", allow_unverified=True)
+    assert list(order.table.columns) == ["Name", "Sequence"]
+    assert order.template_verified is False and order.caveats
+    stores.close_all()
+
+
+def test_generic_order_table_is_always_available(tmp_path, monkeypatch):
+    from plateforge.library import ordering, vendors
+
+    idx, picked, _rows, _meta, _filt, _lib = _selection_fixture(
+        tmp_path, monkeypatch, pick=6)
+    clones = ordering.design(picked, min_order_length=300)
+    order = vendors.emit(clones, "generic")
+    assert order.ok and order.template_verified
+    assert len(order.table) == len(clones)
+    stores.close_all()
+
+
+def test_vendor_limits_are_checked_even_when_the_layout_is_a_guess():
+    import pandas as pd
+    from plateforge.library import vendors
+
+    clones = pd.DataFrame({"clone_id": ["CLN-short", "CLN-fine"],
+                           "order_dna_seq": ["ATGC" * 10, "ATGC" * 100]})
+    order = vendors.emit(clones, "idt_eblocks", allow_unverified=True)
+    assert not order.ok
+    assert set(order.issues["name"]) == {"CLN-short"}
+
+
+# --- germlines from the bundled IMGT tables --------------------------------
+
+def test_imgt_tables_resolve_the_panel_germlines():
+    from plateforge.library import germline_db, germlines
+
+    if not germline_db.anarci_available():
+        pytest.skip("anarci not installed; install the [imgt] extra")
+    for gene in germlines.DEFAULT.genes + [germlines.DEFAULT.light_chain]:
+        found = germline_db.resolve(gene)
+        assert found and found.source == "anarci"
+        assert found.allele and found.allele.startswith(gene)
+        assert not found.is_derived, "an IMGT reference is not a pool consensus"
+
+
+def test_alignment_reference_prefers_imgt_and_names_both_alleles(tmp_path,
+                                                                 monkeypatch):
+    from plateforge.library import germline_db, msa
+
+    if not germline_db.anarci_available():
+        pytest.skip("anarci not installed")
+    _fresh(tmp_path, monkeypatch)
+    src = synth.make_unit(tmp_path / "unit.csv.gz", n=200, seed=91)
+    df, _ = oas.load(src)
+    gene = df["v_gene"].value_counts().index[0]
+    seq, label = msa.reference_for(df[df["v_gene"] == gene], gene)
+    assert label.startswith("IMGT ") and gene in label
+    assert "IGHJ" in label, "the modal J is appended so FR4 has a germline"
+    assert len(seq) > len(germline_db.from_anarci(gene).sequence)
+    stores.close_all()
+
+
+# --- gaps cost what the region says they cost ------------------------------
+
+def test_cdr3_gaps_are_cheaper_than_framework_gaps():
+    from plateforge.library import msa
+
+    numbers = list(range(1, 129))
+    profile = msa.region_gap_profile(numbers)
+    fr1_open, _ = profile[10]            # IMGT 10-ish, FR1
+    cdr3_open, _ = profile[110]          # IMGT 110-ish, CDR3
+    cdr1_open, _ = profile[30]
+    assert cdr3_open > cdr1_open > fr1_open, \
+        "junction gaps must be the cheapest and framework gaps the dearest"
+
+
+def test_a_seam_takes_the_more_permissive_side():
+    """The V/J junction must be relaxed from its first column, not one late."""
+    from plateforge.library import msa
+
+    numbers = [104, 105]                 # FR3 then CDR3
+    profile = msa.region_gap_profile(numbers)
+    assert profile[1] == msa.REGION_GAP_PENALTY["CDR3"]
+
+
+def test_region_of_matches_the_imgt_definitions():
+    from plateforge.library import msa
+
+    assert msa.region_of(1) == "FR1" and msa.region_of(26) == "FR1"
+    assert msa.region_of(27) == "CDR1" and msa.region_of(38) == "CDR1"
+    assert msa.region_of(105) == "CDR3" and msa.region_of(117) == "CDR3"
+    assert msa.region_of(118) == "FR4"
+    assert msa.region_of(None) is None
+
+
+def test_gap_profile_changes_where_the_junction_lands():
+    """A long junction against a mutated framework: the two differ."""
+    from plateforge.library import germline_db, msa
+
+    if not germline_db.anarci_available():
+        pytest.skip("anarci not installed")
+    v = germline_db.from_anarci("IGHV3-23")
+    j = germline_db.from_anarci("IGHJ4")
+    ref = v.sequence + j.sequence
+    msa._NUMBERING[ref] = msa._numbers_for(v) + msa._numbers_for(j)
+
+    mutated = list(v.sequence)
+    for i in (12, 40, 70, 88):                   # somatic hypermutation
+        mutated[i] = "K" if mutated[i] != "K" else "R"
+    query = "".join(mutated) + "GWLSTWYPRQVMKGCADLHNETSPY" + j.sequence
+
+    relaxed = msa.build(ref, {"q": query}, region_aware=True)
+    uniform = msa.build(ref, {"q": query}, region_aware=False)
+    assert relaxed.identity(relaxed.rows[0]) >= uniform.identity(uniform.rows[0])
+
+    # and the junction must sit in CDR3 columns, not spill into FR4
+    spans = {n: (a, b) for n, a, b in relaxed.region_columns()}
+    a, b = spans["CDR3"]
+    assert sum(1 for c in range(a, b) if relaxed.rows[0][c] not in "-.") >= 25
+
+
+def test_region_aware_is_inert_without_numbering():
+    from plateforge.library import msa
+
+    ref = "EVQLLESGGGLVQPGGSLRLSCAAS"
+    a = msa.build(ref, {"q": ref}, region_aware=True)
+    b = msa.build(ref, {"q": ref}, region_aware=False)
+    assert a.ref == b.ref and a.rows == b.rows
+
+
+def test_regions_are_column_spans_that_cover_the_alignment():
+    from plateforge.library import germline_db, msa
+
+    if not germline_db.anarci_available():
+        pytest.skip("anarci not installed")
+    v = germline_db.from_anarci("IGHV3-23")
+    j = germline_db.from_anarci("IGHJ4")
+    ref = v.sequence + j.sequence
+    msa._NUMBERING[ref] = msa._numbers_for(v) + msa._numbers_for(j)
+    m = msa.build(ref, {"q": v.sequence + "ARWWWDY" + j.sequence})
+    spans = m.region_columns()
+    assert [n for n, _, _ in spans] == ["FR1", "CDR1", "FR2", "CDR2", "FR3",
+                                        "CDR3", "FR4"]
+    assert spans[0][1] == 0 and spans[-1][2] == m.width, "spans must tile"
+    for (_, _, end), (_, start, _) in zip(spans, spans[1:]):
+        assert end == start, "spans must not overlap or leave holes"
+
+
+# --- the IgG vector ---------------------------------------------------------
+
+def test_constant_regions_match_the_stored_uniprot_records():
+    """The constants must be derivable from fixtures/, not typed from memory."""
+    from pathlib import Path
+    from plateforge.library import vector
+
+    def read(name):
+        text = Path("fixtures/uniprot") / name
+        return "".join(l.strip() for l in text.read_text().splitlines()
+                       if not l.startswith(">"))
+
+    ighg1 = read("P01857_IGHG1_HUMAN.fasta")
+    secreted = ighg1[:ighg1.index("KSLSLSP") + len("KSLSLSP")] + "GK"
+    assert vector.IGHG1_CH1_CH3_AA == secreted
+    assert vector.IGKC_AA == read("P01834_IGKC_HUMAN.fasta")
+    # and the membrane tail must be gone
+    assert not vector.IGHG1_CH1_CH3_AA.endswith("ELQLEESCAEAQDGELDGLW")
+
+
+def test_igg_constants_translate_to_what_they_claim():
+    from plateforge.library import codon, vector
+
+    for dna, aa in [(vector.IGHG1_CH1_CH3_DNA, vector.IGHG1_CH1_CH3_AA),
+                    (vector.IGKC_DNA, vector.IGKC_AA),
+                    (vector.FURIN_T2A_DNA, vector.FURIN_T2A_AA)]:
+        assert codon.translate(dna) == aa
+
+
+def test_igg_orf_makes_two_chains_from_one_reading_frame():
+    from plateforge.library import codon, vector
+
+    vec = vector.get("pcdna-igg1-t2a-vk-v1")
+    vh = "EVQLLESGGGLVQPGGSLRLSCAASGFTFSSYAMSWVRQAPGKGLEWVSAKGGYFDYWGQGTLVTVSS"
+    orf = vec.orf(codon.optimize(vh, enzymes=("BsaI",)).dna)
+    assert len(orf) % 3 == 0
+    protein = codon.translate(orf)
+    assert protein.count("*") == 1 and protein.endswith("*")
+
+    # heavy chain: leader, VH, then the constant region
+    assert protein.startswith(vector.SIGNAL_AA)
+    assert vh in protein
+    hc_end = protein.index(vector.IGHG1_CH1_CH3_AA)
+    assert hc_end > protein.index(vh)
+
+    # the split, then the light chain with a leader of its own
+    t2a = protein.index(vector.T2A_AA)
+    assert t2a > hc_end
+    lc = protein[t2a + len(vector.T2A_AA):]
+    assert lc.startswith(vector.SIGNAL_AA), "the LC needs its own signal peptide"
+    assert vector.VL_AA in lc and vector.IGKC_AA in lc
+
+
+def test_furin_site_precedes_the_2a_peptide():
+    """Without it the heavy chain keeps the 2A tail on its C-terminus."""
+    from plateforge.library import vector
+
+    vec = vector.get("pcdna-igg1-t2a-vk-v1")
+    assert vector.FURIN_T2A_AA.startswith(vector.FURIN_SITE_AA)
+    assert vector.FURIN_T2A_AA.endswith(vector.T2A_AA)
+    assert vec.protein  # the element is in the vector at all
+    names = [e.name for e in vec.downstream]
+    assert names.index("furin-GSG-T2A") > names.index("IgG1 CH1-hinge-CH2-CH3")
+
+
+def test_dual_cassette_vector_is_the_default_for_ordering(tmp_path, monkeypatch):
+    import json
+    from plateforge.library import ordering
+
+    idx, picked, _r, _m, _f, _l = _selection_fixture(tmp_path, monkeypatch, pick=4)
+    clones = ordering.design(picked)
+    assert set(clones["vector"]) == {"pcdna-igg1-dual-vk-v1"}
+    assert set(clones["construct"]) == {"igg1"}
+    assert (clones["n_chains"] == 2).all(), "two cassettes, two chains"
+    for text in clones["cassettes_json"]:
+        chains = json.loads(text)
+        assert len(chains) == 2
+        # the heavy chain carries the insert and so is the longer of the two
+        assert max(chains.values()) > min(chains.values())
+    # clone_aa_seq is the chain the insert determines, not both concatenated
+    assert (clones["aa_length"] < 600).all()
+    assert (clones["aa_length"] > 300).all()
+    stores.close_all()
+
+
+def test_scfv_vector_is_still_available(tmp_path, monkeypatch):
+    from plateforge.library import ordering
+
+    idx, picked, _r, _m, _f, _l = _selection_fixture(tmp_path, monkeypatch, pick=4)
+    clones = ordering.design(picked, vector_name="pcdna-scfv-vk-v1", fmt="scfv")
+    assert (clones["aa_length"] < 400).all()
+    stores.close_all()
+
+
+# --- the metadata figure ----------------------------------------------------
+
+def test_metadata_table_figure_keeps_clone_id_tails(tmp_path, monkeypatch):
+    from plateforge.library import figures, ordering
+
+    idx, picked, _r, _m, _f, _l = _selection_fixture(tmp_path, monkeypatch, pick=12)
+    clones = ordering.design(picked)
+    p = figures.metadata_table(clones, 10, tmp_path / "meta.png")
+    assert p.exists() and p.stat().st_size > 10_000
+    # ids share a long prefix, so a front-truncated id would be identical in
+    # every row and the figure would say nothing
+    shown = {figures._shorten(c, 14, True) for c in clones["clone_id"].head(10)}
+    assert len(shown) == 10
+    stores.close_all()
+
+
+def test_order_summary_names_the_vector_and_the_junction(tmp_path, monkeypatch):
+    from plateforge.library import ordering, vector
+
+    idx, picked, _r, _m, _f, _l = _selection_fixture(tmp_path, monkeypatch, pick=6)
+    clones = ordering.design(picked)
+    text = ordering.summary_markdown(clones, set_id="CLN-set-test")
+    assert "pcdna-igg1-dual-vk-v1" in text
+    assert "cassettes" in text and "1.5–2:1" in text
+    assert vector.VL_JUNCTION in text and "not** \ngermline-encoded" not in text
+    assert vector.IGHG1_ACCESSION in text and vector.IGKC_ACCESSION in text
+    assert "fixtures/uniprot/" in text
+    assert "CLN-set-test" in text
+    stores.close_all()
+
+
+# --- figures say which run wrote them --------------------------------------
+
+def test_figure_directory_records_the_run_that_wrote_it(tmp_path, monkeypatch):
+    """'Did my figures update?' must be answerable without comparing pixels."""
+    _fresh(tmp_path, monkeypatch)
+    from plateforge.library import figures
+
+    out = tmp_path / "figs"
+    p = figures.stamp(out, run_id="LIB-test-123", note="selection run")
+    text = p.read_text()
+    assert "LIB-test-123" in text and "code" in text and "written" in text
+    stores.close_all()
+
+
+def test_stale_figures_are_detected(tmp_path, monkeypatch):
+    """A PNG left at a path the current version no longer writes is the bug
+    that made an old alignment look current for two releases."""
+    _fresh(tmp_path, monkeypatch)
+    from plateforge.library import figures
+
+    out = tmp_path / "figs"
+    out.mkdir()
+    orphan = out / "alignment_IGHV3-23.png"
+    orphan.write_bytes(b"\x89PNG old")
+    fresh = out / "fig1_genes.png"
+    fresh.write_bytes(b"\x89PNG new")
+
+    found = figures.stale(out, made=[fresh])
+    assert found == [orphan]
+    assert figures.stale(out, made=[fresh, orphan]) == []
+    stores.close_all()
+
+
+# --- CDR3 is one block, anchored at both ends ------------------------------
+
+def test_place_leaves_the_gap_in_the_middle():
+    from plateforge.library import msa
+
+    assert msa.place("ARDY", 12, "center") == "AR--------DY"
+    assert msa.place("ARDY", 12, "left") == "ARDY--------"
+    assert msa.place("ARDY", 4, "center") == "ARDY"
+    # an odd residue goes left, as IMGT does
+    assert msa.place("ARD", 7, "center") == "AR----D"
+
+
+def _igg_ref(gene="IGHV3-23", j="IGHJ4"):
+    from plateforge.library import germline_db, msa
+    v, jj = germline_db.from_anarci(gene), germline_db.from_anarci(j)
+    seq = v.sequence + jj.sequence
+    numbers = msa._numbers_for(v) + msa._numbers_for(jj)
+    return msa._drop_cdr3(seq, numbers)
+
+
+def test_reference_carries_no_cdr3_residues_of_its_own():
+    """Germline CDR3 residues are anchors the aligner would chop the junction on."""
+    from plateforge.library import germline_db, msa
+
+    if not germline_db.anarci_available():
+        pytest.skip("anarci not installed")
+    seq, numbers = _igg_ref()
+    assert not any(105 <= n <= 117 for n in numbers if n is not None)
+    assert 104 in numbers and 118 in numbers, "both anchors must survive"
+    assert len(seq) == len(numbers)
+
+
+def test_the_junction_is_a_single_contiguous_block():
+    from plateforge.library import germline_db, msa
+
+    if not germline_db.anarci_available():
+        pytest.skip("anarci not installed")
+    seq, numbers = _igg_ref()
+    msa._NUMBERING[seq] = numbers
+    queries = {
+        "short": seq[:96] + "ARDY" + seq[96:],
+        "long": seq[:96] + "ARWGYSSGWYFDYYYGMDV" + seq[96:],
+        "mid": seq[:96] + "ARQCINCGFCGGKDY" + seq[96:],
+    }
+    m = msa.build(seq, queries)
+    spans = [s for s in m.region_columns() if s[0] == "CDR3"]
+    assert len(spans) == 1, "one CDR3 block, not confetti"
+    _, a, b = spans[0]
+    assert b - a == 19, "the block is exactly as wide as the longest junction"
+    for row in m.rows:
+        inner = row[a:b]
+        # Centring puts the gap in the middle on purpose, so a short junction
+        # HAS interior gaps. What must not happen is several separate runs --
+        # that is the confetti this replaced.
+        runs = [r for r in re.split(r"[^-]+", inner) if r]
+        assert len(runs) <= 1, f"one gap run, got {len(runs)}: {inner}"
+
+
+def test_junctions_share_their_first_and_last_columns():
+    """Both anchors hold: CDR3s line up at the C end AND the W end."""
+    from plateforge.library import germline_db, msa
+
+    if not germline_db.anarci_available():
+        pytest.skip("anarci not installed")
+    seq, numbers = _igg_ref()
+    msa._NUMBERING[seq] = numbers
+    m = msa.build(seq, {"a": seq[:96] + "ARDY" + seq[96:],
+                        "b": seq[:96] + "ARWGYSSGWYFDY" + seq[96:],
+                        "c": seq[:96] + "ARQCINCGFCGGKDY" + seq[96:]})
+    _, a, b = [s for s in m.region_columns() if s[0] == "CDR3"][0]
+    starts = {row[a:b].index(next(ch for ch in row[a:b] if ch != "-")) for row in m.rows}
+    ends = {len(row[a:b].rstrip("-")) for row in m.rows}
+    assert starts == {0}, "every junction starts in the first CDR3 column"
+    assert ends == {b - a}, "every junction ends in the last CDR3 column"
+
+
+def test_left_justifying_would_be_worse():
+    """The regression this replaces: a short and a long CDR3 sharing only a start."""
+    from plateforge.library import msa
+
+    width = 15
+    short, long_ = "ARDY", "ARQCINCGFCGGKDY"
+    left = [msa.place(short, width, "left"), msa.place(long_, width, "left")]
+    centred = [msa.place(short, width, "center"), msa.place(long_, width, "center")]
+
+    def agreeing(rows):
+        return sum(1 for col in zip(*rows) if len(set(col)) == 1 and col[0] != "-")
+
+    assert agreeing(centred) > agreeing(left), \
+        "centring must line up more residues than left-justifying"
+
+
+def test_deletions_stay_expensive_inside_the_junction():
+    """Only insertions are cheap in CDR3. Losing framework is a strong claim."""
+    from plateforge.library import msa
+
+    ref = "EVQLLESGGGLVQPGGSLRLSCAAS"
+    cheap = [(-0.5, -0.1)] * (len(ref) + 1)
+    _gapped_ref, gapped_seq = msa.align_pair(ref, ref[:8] + ref[14:],
+                                             gap_profile=cheap)
+    assert gapped_seq.count("-") == 6, "the deletion is still taken"
+    runs = [r for r in re.split(r"[^-]+", gapped_seq) if r]
+    assert len(runs) == 1, "one contiguous deletion, not several cheap ones"
+
+
+def test_column_regions_tile_the_whole_alignment():
+    from plateforge.library import germline_db, msa
+
+    if not germline_db.anarci_available():
+        pytest.skip("anarci not installed")
+    seq, numbers = _igg_ref()
+    msa._NUMBERING[seq] = numbers
+    m = msa.build(seq, {"a": seq[:96] + "ARWGYSSGWYFDY" + seq[96:]})
+    per_column = m.column_regions()
+    assert len(per_column) == m.width and all(per_column)
+    spans = m.region_columns()
+    assert [n for n, _, _ in spans] == ["FR1", "CDR1", "FR2", "CDR2", "FR3",
+                                        "CDR3", "FR4"]
+    assert spans[0][1] == 0 and spans[-1][2] == m.width
+
+
+# --- the anchors bracket the junction, always ------------------------------
+
+def _anchored(queries: dict[str, str]):
+    """Build an alignment against a real IMGT reference and return it."""
+    from plateforge.library import germline_db, msa
+    v, j = germline_db.from_anarci("IGHV3-23"), germline_db.from_anarci("IGHJ4")
+    seq, numbers = msa._drop_cdr3(v.sequence + j.sequence,
+                                  msa._numbers_for(v) + msa._numbers_for(j))
+    msa._NUMBERING[seq] = numbers
+    cut = len([n for n in numbers if n is not None and n <= 104])
+    built = {k: seq[:cut] + junction + seq[cut:] for k, junction in queries.items()}
+    return msa.build(seq, built), seq, cut
+
+
+def _junction_bounds(m):
+    _, a, b = [s for s in m.region_columns() if s[0] == "CDR3"][0]
+    starts, ends = set(), set()
+    for row in m.rows:
+        seg = row[a:b]
+        residues = [i for i, c in enumerate(seg) if c != "-"]
+        starts.add(residues[0])
+        ends.add(residues[-1])
+    return starts, ends, b - a
+
+
+def test_every_junction_starts_and_ends_in_the_same_column():
+    from plateforge.library import germline_db
+
+    if not germline_db.anarci_available():
+        pytest.skip("anarci not installed")
+    m, _seq, _cut = _anchored({
+        "short": "ARDY",
+        "mid": "ARGLREYWKIDY",
+        "long": "ARQCINCGFCGGKDYYYGMDV",
+    })
+    starts, ends, width = _junction_bounds(m)
+    assert starts == {0}
+    assert ends == {width - 1}
+
+
+def test_a_missing_cysteine_does_not_shift_that_sequence_left():
+    """The outlier bug: one junction a column left of every other."""
+    from plateforge.library import germline_db, msa
+
+    if not germline_db.anarci_available():
+        pytest.skip("anarci not installed")
+    v, j = germline_db.from_anarci("IGHV3-23"), germline_db.from_anarci("IGHJ4")
+    seq, numbers = msa._drop_cdr3(v.sequence + j.sequence,
+                                  msa._numbers_for(v) + msa._numbers_for(j))
+    msa._NUMBERING[seq] = numbers
+    cut = len([n for n in numbers if n is not None and n <= 104])
+    m = msa.build(seq, {
+        "normal": seq[:cut] + "ARGLREYWKIDY" + seq[cut:],
+        "no_cys": seq[:cut - 1] + "ARGLREYWKIDY" + seq[cut:],      # Cys gone
+        "no_trp": seq[:cut] + "ARGLREYWKIDY" + seq[cut + 1:],      # Trp gone
+    })
+    starts, ends, width = _junction_bounds(m)
+    assert starts == {0}, "a missing anchor must not shift the junction"
+    assert ends == {width - 1}
+
+    # and the anchor column shows a gap rather than a borrowed residue
+    _, a, _b = [s for s in m.region_columns() if s[0] == "CDR3"][0]
+    by_label = dict(zip(m.labels, m.rows))
+    assert by_label["no_cys"][a - 1] == "-"
+
+
+def test_a_junction_containing_tryptophan_keeps_its_own_columns():
+    """Why the anchors are not enforced by residue identity.
+
+    Forbidding non-W at the tryptophan column lets any W inside a junction
+    capture that column from across the block, tearing the junction in two.
+    """
+    from plateforge.library import germline_db
+
+    if not germline_db.anarci_available():
+        pytest.skip("anarci not installed")
+    m, _seq, _cut = _anchored({
+        "with_w": "ARGLREYWKIDY",          # a W in the middle of the junction
+        "plain": "ARGLREYAKIDY",
+    })
+    starts, ends, width = _junction_bounds(m)
+    assert starts == {0} and ends == {width - 1}
+    for row in m.rows:
+        _, a, b = [s for s in m.region_columns() if s[0] == "CDR3"][0]
+        runs = [r for r in re.split(r"[^-]+", row[a:b]) if r]
+        assert len(runs) <= 1, "the junction must not be torn in two"
+
+
+def test_consolidation_is_a_no_op_when_the_anchors_are_intact():
+    from plateforge.library import msa
+
+    at = list("CW")
+    before = ["", "ARDY", ""]
+    msa.consolidate_junction(at, before, "CW", 0, 1)
+    assert at == ["C", "W"] and before[1] == "ARDY"
+
+
+# --- where the data tree lives ---------------------------------------------
+
+def test_data_root_defaults_inside_the_checkout(monkeypatch):
+    from plateforge.core import paths
+
+    monkeypatch.delenv("PLATEFORGE_DATA", raising=False)
+    root = paths.repo_root()
+    assert root is not None and (root / "pyproject.toml").exists()
+    assert paths.default_root() == root / "plateforge-data"
+
+
+def test_data_root_does_not_follow_the_working_directory(monkeypatch, tmp_path):
+    """Two half-populated pools is a bad afternoon."""
+    from plateforge.core import paths
+
+    monkeypatch.delenv("PLATEFORGE_DATA", raising=False)
+    first = paths.default_root()
+    monkeypatch.chdir(tmp_path)
+    assert paths.default_root() == first
+
+
+def test_environment_still_wins(monkeypatch, tmp_path):
+    from plateforge.core import paths
+
+    monkeypatch.setenv("PLATEFORGE_DATA", str(tmp_path / "elsewhere"))
+    assert paths.data_root() == tmp_path / "elsewhere"
+
+
+def test_the_data_tree_is_gitignored():
+    from pathlib import Path
+
+    ignored = Path(".gitignore").read_text()
+    assert "/plateforge-data/" in ignored
+
+
+# --- two cassettes, two transcripts ----------------------------------------
+
+def test_a_cassette_knows_whether_it_carries_the_insert():
+    from plateforge.library import vector
+
+    vec = vector.get("pcdna-igg1-dual-vk-v1")
+    carrying = [c for c in vec.cassettes if c.carries_insert]
+    assert len(carrying) == 1 and carrying[0] is vec.insert_cassette
+    assert len(vec.cassettes) == 2
+
+
+def test_each_cassette_is_its_own_reading_frame():
+    """The light chain is not downstream of the heavy chain in any frame."""
+    from plateforge.library import codon, vector
+
+    vec = vector.get("pcdna-igg1-dual-vk-v1")
+    vh = "EVQLLESGGGLVQPGGSLRLSCAASGFTFSSYAMSWVRQAPGKGLEWVSAKGGYFDYWGQGTLVTVSS"
+    dna = codon.optimize(vh, enzymes=("BsaI",)).dna
+    proteins = vec.proteins(dna)
+    assert len(proteins) == 2
+    for name, protein in proteins.items():
+        assert protein.count("*") == 1 and protein.endswith("*")
+        assert protein.startswith(vector.SIGNAL_AA), \
+            f"{name} needs its own signal peptide"
+
+    heavy = proteins["HC (CMV)"]
+    light = proteins["LC (CAG)"]
+    assert vh in heavy and vector.IGHG1_CH1_CH3_AA in heavy
+    assert vector.VL_AA in light and vector.IGKC_AA in light
+    assert vh not in light, "the insert must appear in exactly one cassette"
+    assert vector.T2A_AA not in heavy and vector.T2A_AA not in light
+
+
+def test_the_ordered_fragment_is_unchanged_by_the_vector_swap():
+    """Fusion sites are in the constant flanks, so the eBlocks do not move."""
+    from plateforge.library import cloning, codon, vector
+
+    dual = vector.get("pcdna-igg1-dual-vk-v1")
+    t2a = vector.get("pcdna-igg1-t2a-vk-v1")
+    assert dual.fusion_sites() == t2a.fusion_sites()
+
+    vh = "EVQLLESGGGLVQPGGSLRLSCAASGFTFSSYAMSWVRQAPGKGLEWVSAKGGYFDYWGQGTLVTVSS"
+    cds = codon.optimize(vh, enzymes=("BsaI",)).dna
+    a = cloning.design(cds, dual, "golden_gate", min_length=300)
+    b = cloning.design(cds, t2a, "golden_gate", min_length=300)
+    assert a.dna == b.dna, "a vector change must not reprint the order"
+
+
+def test_verify_checks_every_cassette_not_just_the_insert_s():
+    from plateforge.library import cloning, codon, vector
+
+    vec = vector.get("pcdna-igg1-dual-vk-v1")
+    vh = "EVQLLESGGGLVQPGGSLRLSCAASGFTFSSYAMSWVRQAPGKGLEWVSAKGGYFDYWGQGTLVTVSS"
+    cds = codon.optimize(vh, enzymes=("BsaI",)).dna
+    fragment = cloning.design(cds, vec, "golden_gate", min_length=300)
+    assert cloning.verify(fragment, cds, vec, expected_protein=vh) == []
+
+    # break the cassette that does NOT carry the insert
+    broken = vector.Vector(
+        name="broken", backbone="t", insert="VH", enzyme="BsaI",
+        cassettes=(vec.cassettes[0],
+                   vector.Cassette("LC (broken)", tuple(
+                       e if e.kind != "domain"
+                       else vector.Element(e.name, e.kind, dna=e.dna[:-1],
+                                           aa=e.aa)
+                       for e in vec.cassettes[1].elements))))
+    problems = cloning.verify(fragment, cds, broken, expected_protein=vh)
+    assert any("LC (broken)" in p for p in problems), \
+        "a fault in the second cassette must not go unreported"
+
+
+def test_declared_bp_does_not_pretend_to_know_the_promoters():
+    from plateforge.library import vector
+
+    vec = vector.get("pcdna-igg1-dual-vk-v1")
+    sizes = vec.declared_bp("N" * 360)
+    assert sizes["_undeclared_elements"] >= 3, \
+        "promoters and the backbone have no sequence here and must be counted out"
+    assert sizes["HC (CMV)"] > sizes["LC (CAG)"]
+    assert sizes["_total_declared"] == sizes["HC (CMV)"] + sizes["LC (CAG)"]
+
+
+def test_the_t2a_vector_is_still_registered():
+    """Kept for comparison; the decision record says why it is not default."""
+    from plateforge.library import vector
+
+    assert "pcdna-igg1-t2a-vk-v1" in vector.VECTORS
+    assert len(vector.get("pcdna-igg1-t2a-vk-v1").cassettes) == 1
+
+
+# --- figures cannot go stale silently --------------------------------------
+
+def test_a_figure_directory_records_which_run_wrote_it(tmp_path):
+    from plateforge.library import figures
+
+    figures.stamp(tmp_path, run_id="LIB-test-1", note="selection run")
+    text = (tmp_path / "FIGURES_FROM.txt").read_text()
+    assert "LIB-test-1" in text and "selection run" in text
+    assert "code" in text and "written" in text
+
+
+def test_a_figure_nothing_wrote_this_run_is_reported_as_stale(tmp_path):
+    """The bug this exists for: an output path moved and the old PNG stayed.
+
+    figures/real/alignment_IGHV3-23.png sat in place across two releases
+    looking perfectly current while being produced by code that no longer
+    existed. Nothing about the file said so.
+    """
+    from plateforge.library import figures
+
+    fresh = tmp_path / "fig1.png"
+    fresh.write_bytes(b"\x89PNG fresh")
+    orphan = tmp_path / "alignment_IGHV3-23.png"
+    orphan.write_bytes(b"\x89PNG old")
+
+    stale = figures.stale(tmp_path, made=[fresh])
+    assert stale == [orphan]
+    assert figures.stale(tmp_path, made=[fresh, orphan]) == []
+
+
+def test_stale_ignores_a_directory_that_does_not_exist(tmp_path):
+    from plateforge.library import figures
+
+    assert figures.stale(tmp_path / "nope", made=[]) == []
+
+
+def test_the_scripts_stamp_and_check_their_figure_directories():
+    """Both entry points must do this, or the trap is only half closed."""
+    from pathlib import Path
+
+    for script in ("scripts/fetch_oas.py", "scripts/order.py"):
+        text = Path(script).read_text()
+        assert "figures.stamp(" in text, f"{script} must stamp its figures"
+    assert "figures.stale(" in Path("scripts/fetch_oas.py").read_text()

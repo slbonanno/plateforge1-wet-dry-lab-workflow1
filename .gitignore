@@ -13,3 +13,7 @@ outputs/
 # generated figures only -- docs/figures/ is committed for the README
 /figures/
 .DS_Store
+
+# The data tree: pools, stores, run bundles. Big, regenerable, not ours to
+# version. Override the location with PLATEFORGE_DATA.
+/plateforge-data/

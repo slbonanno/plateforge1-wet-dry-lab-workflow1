@@ -187,21 +187,31 @@ def load_study(study: str, filt: oas.Filter | None = None, chain: str = "heavy",
 
 
 def alignment_report(df: pd.DataFrame) -> pd.DataFrame:
-    """Per germline: are the sequences the same length, i.e. column-aligned?
+    """Per germline: can these sequences be aligned, and by which route.
 
-    The alignment figure assumes IMGT-gapped sequences of one germline share
-    columns. That holds for OAS's own files; whether it survives the mirror is
-    a question about real data, so it gets measured rather than assumed.
+    `numbered` is what matters. The alignment figure lays sequences out by
+    their ANARCI IMGT positions, so a sequence with numbering aligns whatever
+    its length.
+
+    `raw_lengths` is informational. Real reads cover different spans of the
+    domain, so sequence_alignment_aa is never fixed width -- IGHV3-23 typically
+    shows 40+ distinct lengths. That is expected, and is precisely why the
+    figure does not align on string position. It only matters for the fallback
+    renderer, used when numbering is absent, which restricts to the modal
+    length and says how many rows it excluded.
     """
     rows = []
     for gene, sub in df.groupby("v_gene"):
-        lens = sub["aa_gapped"].str.len()
+        lens = sub["aa_gapped"].str.len() if "aa_gapped" in sub.columns else pd.Series(dtype=int)
+        numbered = (sub["anarci_numbering"].notna().sum()
+                    if "anarci_numbering" in sub.columns else 0)
         rows.append({
             "v_gene": gene,
             "n": len(sub),
-            "distinct_lengths": int(lens.nunique()),
-            "min_len": int(lens.min()),
-            "max_len": int(lens.max()),
-            "column_aligned": bool(lens.nunique() == 1),
+            "numbered": int(numbered),
+            "can_align": bool(numbered >= 2),
+            "raw_lengths": int(lens.nunique()) if len(lens) else 0,
+            "min_len": int(lens.min()) if len(lens) else 0,
+            "max_len": int(lens.max()) if len(lens) else 0,
         })
     return pd.DataFrame(rows).sort_values("n", ascending=False).reset_index(drop=True)

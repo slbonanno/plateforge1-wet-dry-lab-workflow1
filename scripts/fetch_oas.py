@@ -21,9 +21,9 @@ import argparse
 import os
 import sys
 
-os.environ.setdefault("PLATEFORGE_DATA", os.path.expanduser("~/plateforge-data"))
 
-from plateforge.library import diversity, figures, germlines, oas, pool  # noqa: E402
+from plateforge.library import (diversity, figures, germlines, msa, oas,  # noqa: E402
+                                pool, selection)
 
 
 def main() -> None:
@@ -52,6 +52,18 @@ def main() -> None:
                     help="print the filter funnel even when rows survive")
     ap.add_argument("--keep-liabilities", action="store_true",
                     help="keep sequences ANARCI flagged (length notes are kept either way)")
+    ap.add_argument("--genes", nargs="*", default=None,
+                    help="V genes to keep, e.g. --genes IGHV3-23 IGHV3-53. "
+                         "Default is the panel; --any-gene keeps everything.")
+    ap.add_argument("--align-rows", type=int, default=50,
+                    help="sequences per family in the alignment figures")
+    ap.add_argument("--aligner", default="reference",
+                    choices=["reference", "mafft", "clustalo"],
+                    help="reference = built-in germline-anchored aligner (no "
+                         "install needed). The others are used if on PATH.")
+    ap.add_argument("--imgt-fasta",
+                    help="IMGT/GENE-DB AA FASTA on disk; used as the alignment "
+                         "reference instead of the OAS germline consensus")
     args = ap.parse_args()
 
     if args.list_studies:
@@ -66,7 +78,8 @@ def main() -> None:
 
     filt = oas.Filter(
         chain="H" if args.chain == "heavy" else "L",
-        genes=None if (args.any_gene or args.chain == "light") else germlines.DEFAULT.genes,
+        genes=(None if (args.any_gene or args.chain == "light")
+               else (args.genes or germlines.DEFAULT.genes)),
         cdr3_len_range=(8, 30),
         min_redundancy=None,
         exclude_liabilities=not args.keep_liabilities,
@@ -82,6 +95,7 @@ def main() -> None:
     else:
         df, meta = oas.load(args.source, filt, limit=args.limit or None)
 
+    meta["_source_kind"] = "mirror" if args.study else "local file"
     print(f"\nspecies={meta.get('Species')}  chain={meta.get('Chain')}  "
           f"btype={meta.get('BType')}  isotype={meta.get('Isotype')}")
     print(f"disease={meta.get('Disease')}  author={meta.get('Author')}")
@@ -105,17 +119,25 @@ def main() -> None:
     counts = oas.flag_counts(df)
     print(counts.head(8).to_string() if len(counts) else "  (none)")
 
-    run_id = pool.ingest(df, meta)
+    drift = pool.schema_drift()
+    if drift:
+        print(f"\nthe stored pool is missing {len(drift)} column(s) this version "
+              f"produces: {', '.join(drift[:6])}"
+              + (" ..." if len(drift) > 6 else ""))
+        print("re-ingesting those rows so they pick the columns up "
+              "(seq_id is a content hash, so a plain re-run would skip them).")
+
+    run_id = pool.ingest(df, meta, refresh=bool(drift))
     idx = pool.index()
     print(f"\ningest {run_id}\npool now holds {len(idx):,} sequences")
     print(idx["v_gene"].value_counts().head(12).to_string())
 
     full = pool.fetch(list(idx["seq_id"]),
-                      columns=["seq_id", "v_gene", "aa_gapped", "germline_aa"]
+                      columns=["seq_id", "v_gene", "j_gene", "aa_gapped", "germline_aa"]
                               + oas.REGION_COLUMNS)
-    from plateforge.library import hf as _hf
-    print("\ncolumn alignment per germline (the alignment figure needs this):")
-    print(_hf.alignment_report(full).head(8).to_string(index=False))
+    if args.aligner != "reference" and args.aligner not in msa.available_backends():
+        print(f"\n{args.aligner} is not on PATH; using the built-in aligner")
+        args.aligner = "reference"
 
     picked = diversity.sample(idx, args.pick, seed=args.seed,
                               unique_cdr3=not args.allow_duplicate_cdr3)
@@ -138,10 +160,48 @@ def main() -> None:
                                parents={run_id: "sampled_from"})
     print(f"\nlibrary {lib_id}")
 
+    # The alignments describe the sequences that were SELECTED -- these are
+    # the ones marched through the downstream steps. Aligning the whole pool
+    # would be a picture of the repertoire, not of this order.
+    picked_rows = full[full["seq_id"].isin(set(picked["seq_id"]))]
+
+    # Figures first, so the summary panel can go into the run bundle too.
     made = figures.all_figures(idx, picked, args.out)
-    gene = idx["v_gene"].value_counts().index[0]
-    made.append(figures.alignment(full, gene, f"{args.out}/alignment_{gene}.png"))
+    gene = picked["v_gene"].value_counts().index[0]
     made.append(figures.aa_legend(f"{args.out}/aa_legend.png"))
+    made.append(figures.summary_panel(idx, picked, picked_rows, gene=gene,
+                                      out=f"{args.out}/input_summary.png",
+                                      max_alignment_rows=args.align_rows))
+    # The per-gene alignments also go here, not only into the run bundle.
+    # They used to live only here; moving them left an orphan PNG at the old
+    # path that no later run overwrote, so it sat there looking current.
+    made.extend(figures.alignments_per_gene(picked_rows, args.out,
+                                            max_rows=args.align_rows,
+                                            backend=args.aligner,
+                                            fasta_path=args.imgt_fasta).values())
+    bundle = selection.run(
+        lib_id=lib_id, pool_index=idx, picked=picked,
+        alignment_rows=picked_rows, meta=meta,
+        n_requested=args.pick, seed=args.seed,
+        filter_spec=filt, funnel=funnel, diversity_report=report,
+        max_alignment_rows=args.align_rows, backend=args.aligner,
+        fasta_path=args.imgt_fasta,
+        extra_files={"input_summary.png": f"{args.out}/input_summary.png"},
+    )
+
+    figures.stamp(args.out, run_id=lib_id, note="selection run")
+    orphans = figures.stale(args.out, made)
+    if orphans:
+        print(f"\n{len(orphans)} figure(s) in {args.out} were NOT written by "
+              f"this run and are stale:")
+        for p in orphans[:8]:
+            print(f"  {p.name}")
+        print("  delete them, or `rm -rf figures/` before re-running.")
+
+    print(f"\nrun bundle {bundle.dir}")
+    print(f"README block ready to paste: {bundle.dir / 'summary.md'}")
+    for f in sorted(p.name for p in bundle.dir.iterdir()):
+        print(f"  {f}")
     print("\nfigures:")
     for p in made:
         print(f"  {p}")

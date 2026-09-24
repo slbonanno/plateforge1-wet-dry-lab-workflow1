@@ -3,17 +3,19 @@
 Needed for two jobs the construct step depends on: the fixed light chain an
 scFv is built against, and the `Hu_germline` annotation on every ordered clone.
 
-There is no offline germline database in any pip package, and IMGT/GENE-DB and
-OGRDB are both plain HTTP downloads that may or may not be reachable from a
-given machine -- OPIG taught us not to assume. So this is a registry of
-sources, tried in order, with one backend that always works:
+IMGT/GENE-DB and OGRDB are plain HTTP downloads that may or may not be
+reachable from a given machine -- OPIG taught us not to assume, and IMGT itself
+returns 403 through some proxies. So this is a registry of sources, tried in
+order:
 
-  pool    consensus of OAS's own germline_alignment_aa, per gene, mapped onto
-          IMGT columns. No network, and it is IgBlast's IMGT-derived germline
-          rather than a guess -- but it only covers genes present in the pool,
-          and only the span the reads covered.
-  fasta   an IMGT/GENE-DB FASTA already on disk. Authoritative and complete.
+  anarci  IMGT germline tables bundled inside the `anarci` pip package.
+          Authoritative, complete, and offline -- no download, no 403. This is
+          the default and closes Q17. Install with `pip install -e ".[imgt]"`.
+  fasta   an IMGT/GENE-DB FASTA already on disk. Same data, if you have it.
   url     the same, fetched. Works where the host is reachable.
+  pool    consensus of OAS's own germline_alignment_aa, per gene, mapped onto
+          IMGT columns. The last resort: it only covers genes present in the
+          pool, and only the span the reads covered.
 
 Every result carries where it came from and how well supported it is, because
 a germline assembled from 12 reads and one downloaded from IMGT should not be
@@ -58,6 +60,70 @@ class Germline:
     def summary(self) -> str:
         where = f"{self.source}" + (f" (n={self.support})" if self.is_derived else "")
         return f"{self.gene} [{where}] {len(self.sequence)} aa"
+
+
+# --- bundled IMGT tables ---------------------------------------------------
+
+def _anarci_tables():
+    """The IMGT germline dictionaries the anarci package ships, or None."""
+    try:
+        from anarci import germlines as _g          # noqa: PLC0415
+    except Exception:                               # noqa: BLE001
+        return None
+    return getattr(_g, "all_germlines", None)
+
+
+def anarci_available() -> bool:
+    return _anarci_tables() is not None
+
+
+_CHAIN_KEYS = {"H": "H", "K": "K", "L": "L"}
+
+
+def _anarci_lookup(kind: str, gene: str, species: str = "human"):
+    """(allele, IMGT-gapped aa) for the lowest-numbered allele of `gene`.
+
+    The stored strings are IMGT-gapped to 128 positions, so index + 1 is the
+    IMGT number -- which is how region boundaries are known without running
+    ANARCI on anything.
+    """
+    tables = _anarci_tables()
+    if tables is None or kind not in tables:
+        return None
+    letter = gene[2] if len(gene) > 2 else "H"
+    by_species = tables[kind].get(_CHAIN_KEYS.get(letter, "H"), {})
+    entries = by_species.get(species) or {}
+    hits = sorted(k for k in entries if k.split("*", 1)[0] == gene)
+    if not hits:
+        return None
+    allele = hits[0]
+    return allele, entries[allele]
+
+
+@SOURCES.register("anarci", needs_network=False, authoritative=True)
+def from_anarci(gene: str, species: str = "human") -> Germline | None:
+    """IMGT reference for a V gene, straight out of the anarci package."""
+    kind = "J" if gene[3:4] == "J" else "V"
+    found = _anarci_lookup(kind, gene, species)
+    if not found:
+        return None
+    allele, gapped = found
+    by_position = {str(i + 1): aa for i, aa in enumerate(gapped)
+                   if aa not in "-."}
+    return Germline(gene=gene,
+                    sequence=gapped.replace("-", "").replace(".", ""),
+                    source="anarci", allele=allele, by_position=by_position,
+                    notes="IMGT reference bundled with the anarci package")
+
+
+def known_genes(kind: str = "V", chain: str = "H",
+                species: str = "human") -> list[str]:
+    """Every gene the bundled tables carry. Empty when anarci is not installed."""
+    tables = _anarci_tables()
+    if tables is None:
+        return []
+    entries = tables.get(kind, {}).get(chain, {}).get(species, {})
+    return sorted({k.split("*", 1)[0] for k in entries})
 
 
 # --- pool-derived ----------------------------------------------------------
@@ -168,20 +234,22 @@ def from_url(gene: str, url: str = IMGT_GENEDB_URL) -> Germline | None:
 
 # --- resolution ------------------------------------------------------------
 
-def resolve(gene: str, order: tuple[str, ...] = ("fasta", "pool"),
+def resolve(gene: str, order: tuple[str, ...] = ("anarci", "fasta", "pool"),
             fasta_path: str | Path | None = None,
             rows: pd.DataFrame | None = None,
             url: str = IMGT_GENEDB_URL) -> Germline | None:
     """First source that yields a germline for this gene.
 
-    Default order prefers an authoritative local FASTA and falls back to the
-    pool, so a machine with IMGT data gets the real thing and one without still
-    gets something usable and clearly labelled.
+    Default order prefers the bundled IMGT tables, then a local FASTA, then the
+    pool consensus. A machine with anarci installed always gets the real IMGT
+    reference; one without still gets something usable and clearly labelled.
     """
     gene = germlines.gene(gene) or gene
     for name in order:
         try:
-            if name == "fasta":
+            if name == "anarci":
+                found = from_anarci(gene)
+            elif name == "fasta":
                 if not fasta_path:
                     continue
                 found = from_fasta(gene, fasta_path)

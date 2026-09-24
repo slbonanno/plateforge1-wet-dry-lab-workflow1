@@ -17,17 +17,53 @@ from . import oas
 POOL_TABLE = "oas_pool"
 
 
-def ingest(df: pd.DataFrame, meta: dict, produced_by: str = "library.oas") -> str:
-    """Add normalized rows to the pool. Returns the ingest RUN artifact id."""
+def schema_drift() -> list[str]:
+    """Columns the current code produces that the stored parquet lacks.
+
+    seq_id is a content hash, so re-ingesting the same sequences adds nothing --
+    which is what makes ingest idempotent, and also means a pool written by an
+    older version never gains a column added since. That is silent: the column
+    is simply absent, and whatever needed it renders empty. Hence this check.
+    """
+    try:
+        stored = set(bulk.read(POOL_TABLE, columns=None).columns)
+    except FileNotFoundError:
+        return []
+    return [c for c in oas.INDEX_COLUMNS + ["anarci_numbering", "aa_gapped",
+                                            "germline_aa"] + oas.REGION_COLUMNS
+            if c not in stored]
+
+
+def ingest(df: pd.DataFrame, meta: dict, produced_by: str = "library.oas",
+           refresh: bool = False) -> str:
+    """Add normalized rows to the pool. Returns the ingest RUN artifact id.
+
+    `refresh` replaces rows that are already stored instead of skipping them,
+    which is how a pool written by older code picks up columns added since.
+    """
     run_id = ids.mint_stamped("RUN", "ingest")
-    if len(df):
+    if len(df) and not refresh:
         existing = set(known_ids())
         fresh = df[~df["seq_id"].isin(existing)].reset_index(drop=True)
     else:
-        fresh = df
+        fresh = df.reset_index(drop=True)
 
     if len(fresh):
-        bulk.write(POOL_TABLE, fresh, append=True, key="seq_id")
+        if refresh:
+            # Newest wins, so a re-read with more columns replaces the old row.
+            try:
+                prior = bulk.read(POOL_TABLE)
+                prior = prior[~prior["seq_id"].isin(set(fresh["seq_id"]))]
+                bulk.write(POOL_TABLE, pd.concat([fresh, prior], ignore_index=True),
+                           key="seq_id")
+            except FileNotFoundError:
+                bulk.write(POOL_TABLE, fresh, key="seq_id")
+            conn = stores.connect("library")
+            conn.executemany("DELETE FROM sequences WHERE seq_id = ?",
+                             [(s,) for s in fresh["seq_id"]])
+            conn.commit()
+        else:
+            bulk.write(POOL_TABLE, fresh, append=True, key="seq_id")
         conn = stores.connect("library")
         cols = [c for c in oas.INDEX_COLUMNS if c in fresh.columns]
         rows = fresh[cols].copy()

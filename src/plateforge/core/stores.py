@@ -69,13 +69,32 @@ def _split_columns(body: str) -> list[str]:
     return [p.strip() for p in parts if p.strip()]
 
 
+def strip_comments(sql: str) -> str:
+    """Remove -- comments, preserving line structure.
+
+    This has to happen BEFORE splitting a table body on commas, not after.
+    A comment containing a comma -- and a comment enumerating the allowed
+    values of a column almost always does -- otherwise splits one column
+    definition into two pieces. The piece before the comma ends inside the
+    comment and is discarded as empty, so the NEXT column silently vanishes
+    from the migration; the piece after begins mid-sentence and is read as a
+    column definition, which is how a table ends up being asked for a column
+    called `not`.
+
+    Silently skipping a column is the bad half: the schema declares it, the
+    database never gains it, and the failure surfaces later as a missing
+    column at write time.
+    """
+    return "\n".join(line.split("--", 1)[0] for line in sql.splitlines())
+
+
 def declared_columns(schema_sql: str) -> dict[str, dict[str, str]]:
     """{table: {column: full definition}} as the schema file declares them."""
     out: dict[str, dict[str, str]] = {}
-    for table, body in _CREATE_TABLE.findall(schema_sql):
+    for table, body in _CREATE_TABLE.findall(strip_comments(schema_sql)):
         cols: dict[str, str] = {}
         for piece in _split_columns(body):
-            line = piece.split("--", 1)[0].strip()
+            line = " ".join(piece.split()).strip()
             if not line or _TABLE_CONSTRAINT.match(line):
                 continue
             cols[line.split()[0]] = line

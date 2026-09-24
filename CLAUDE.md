@@ -92,10 +92,14 @@ README under `src/plateforge/*/README.md`, which are fair game.
 
 ## Current state
 
-`core` and `library` are built and tested (38 tests). `assay`, `reagents` and
-`emit` are still stubs.
+`core`, `library`, `assay` and `emit` are built and tested (311 tests).
+`reagents` is still a stub.
 
-`library` covers OAS ingest, the sequence pool, and diversity-aware sampling. It
+`library` covers OAS ingest, the sequence pool, diversity-aware sampling,
+germline-anchored alignment (`library.msa`, decision 0014), run bundles
+(`library.selection` + `core.runs`, decision 0015) and the ordering path
+(`library.vector` / `cloning` / `vendors` / `ordering`, decisions 0016-0018,
+0020). It
 is tested entirely against synthetic OAS-format units (`library.synth`), so the
 suite runs with no network and no downloaded data. A real OAS fixture is still
 outstanding (Q9).
@@ -105,8 +109,42 @@ and `real/`. Committed README figures live in `docs/figures/`. Never mix them:
 a synthetic figure presented as real is the most damaging mistake this repo
 can make.
 
-The next piece of work is `assay`: experiment definition from JSON, plate layout,
-and clone registration from a `LIB` id.
+Germline references come from the IMGT tables bundled with `anarci`
+(`pip install -e ".[imgt]"`); IMGT's own download is unreachable from here and
+no longer on the critical path (decision 0017).
+
+`docs/pipeline.md` is the two-command tour of what exists end to end.
+
+`assay` is the plate lineage layer (decision 0019): **the clone is tracked,
+plates are containers, steps are registry entries.** The working chain runs
+transfect → harvest → beads → IP → elute → magnet → BLI → normalise, and a
+well traces back to the plate it was ordered on.
+
+`emit` writes instrument worklists, one registered emitter per instrument,
+each declaring how well its format is known — `verified`, `documented` or
+`sketch` (decision 0021). Nothing is `verified` but our own format, and a test
+asserts that. Tecan `.gwl` and Opentrons protocols are `documented`; INTEGRA,
+Hamilton, Beckman and Agilent refuse and say what would unblock them.
+`fixtures/integra/` and `fixtures/octet/` list exactly what to capture.
+
+`core.lab` holds which instruments this lab has, so the agent's "which robot
+do you have?" is asked once and stored.
+
+`assay.elisa` simulates paired target/control ELISA plates (decision 0022),
+stamped SIMULATED everywhere. It is deliberately hard to classify: panels vary
+from zero binders upward and the control antigen has real binders of its own.
+
+`assay.readers` parses plate exports by finding the grid by shape rather than
+by vendor layout, and `assay.assign` matches grids to `PLT` artifacts with
+explicit precedence — a model guess always needs confirmation (decision 0023).
+A 96-well plate rarely holds 96 samples, and features computed over empty
+wells are wrong rather than noisy, so the plate map or the sample count has to
+be supplied.
+
+`scripts/run_all.py` reproduces every claim on the machine running it.
+
+The next piece of work is hit calling, then `reagents`, and closing Q15/Q7
+with real files — including a real Gen5 export.
 
 Known-undecided areas are listed in `decisions/0004-open-questions.md`. Schemas
 in `core/schema/` are expected to gain columns; that is normal. What is expensive

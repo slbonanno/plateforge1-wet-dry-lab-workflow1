@@ -5,6 +5,7 @@ acceptance test: if the sampler stops working, figure 3 shows it immediately.
 """
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import matplotlib
@@ -174,6 +175,12 @@ AA_GROUPS = {
 }
 GAP_COLOR = "#f0efe9"
 UNKNOWN_COLOR = "#c9c8c1"
+# Three greys, in decreasing weight: the germline reference, a residue that
+# matches it, and a gap. The germline is the darkest because it is the thing
+# being read against; nothing on that row is ever filled.
+REF_INK = "#3a3935"
+MATCH_INK = "#9c9a92"
+GAP_INK = "#b0aea6"
 
 
 def _text_on(hex_color: str) -> str:
@@ -288,208 +295,210 @@ def region_spans(row: pd.Series, gapped: str) -> list[tuple[str, int, int]]:
     return spans
 
 
-def alignment(rows: pd.DataFrame, gene: str, out: str | Path = "fig5_alignment.png",
-              max_rows: int = 24, highlight_only_differences: bool = True,
+def build_msa(rows: pd.DataFrame, gene: str, *, max_rows: int = 50,
               seq_column: str = "aa_gapped", germline_column: str = "germline_aa",
-              show_regions: bool = True, allow_ragged: bool = False,
-              use_numbering: bool = True):
-    """Geneious-style alignment for one germline, against the germline reference.
+              backend: str = "reference", fasta_path=None,
+              order_by: str | None = "cdr3_len"):
+    """Align one V gene's sequences against that gene's germline.
 
-    Every residue letter is printed. With `highlight_only_differences` (the
-    default) only positions that differ from the germline get a coloured fill;
-    matching positions show the letter in muted ink on no fill, so the sequence
-    stays readable while divergence is what catches the eye.
+    Returns (Msa, source_rows) where source_rows is the frame the alignment was
+    built from, in the same order as the Msa's rows -- callers need it for
+    region bands and for labelling.
 
-    Sequences from a single V gene arrive IMGT-gapped from OAS, so the columns
-    already line up and no aligner is needed. The reference row is the germline
-    OAS carries per sequence; where that is absent the observed consensus is
-    used and the row is labelled as such.
+    Nothing is excluded for being short. A 5' truncated read aligns with
+    leading gaps, which is what the gaps are for.
     """
-    sub_all = rows[rows["v_gene"] == gene]
-    if sub_all.empty:
+    from . import msa as _msa
+
+    sub = rows[rows["v_gene"] == gene] if "v_gene" in rows.columns else rows
+    if sub.empty:
         raise ValueError(f"no sequences for {gene}")
-
-    # Preferred path: ANARCI IMGT numbering gives every residue its column, so
-    # ragged reads align properly instead of being excluded for being short.
-    if use_numbering:
-        drawn = _alignment_from_numbering(
-            sub_all.head(max_rows), gene, out,
-            highlight_only_differences=highlight_only_differences,
-            show_regions=show_regions)
-        if drawn is not None:
-            return drawn
-
-    sub = sub_all
     if seq_column not in sub.columns:
         raise KeyError(
             f"{seq_column!r} not in the frame; pass pool.fetch(...) output, "
             "which reads the parquet side where the gapped sequence lives")
-    # Columns only mean anything if the sequences share them. OAS units are
-    # IMGT-gapped so one germline's sequences are equal length, but reads that
-    # do not cover the whole domain come back shorter. Padding those on the
-    # right would slide every residue out of register and draw a confident,
-    # wrong picture -- so restrict to the modal length and say so.
-    lengths = sub[seq_column].astype(str).str.len()
-    modal = int(lengths.mode().iloc[0])
-    n_total = len(sub)
-    aligned = sub[lengths == modal]
-    dropped = n_total - len(aligned)
-    if dropped and not allow_ragged:
-        sub = aligned
-    elif dropped and allow_ragged:
-        sub = sub.assign(**{seq_column: sub[seq_column].astype(str).str.ljust(modal, ".")})
 
+    ref, ref_source = _msa.reference_for(sub, gene, germline_column, fasta_path)
+    if not ref:
+        return None, sub
+
+    if order_by and order_by in sub.columns:
+        sub = sub.sort_values([order_by, "seq_id"], kind="stable")
     sub = sub.head(max_rows)
-    seqs = [str(s) for s in sub[seq_column]]
-    labels = [str(s) for s in sub["seq_id"]]
-    width = max(len(s) for s in seqs)
-    seqs = [s.ljust(width, ".") for s in seqs]
 
-    ref, ref_label = reference_row(sub, seqs, germline_column)
-    ref = ref.ljust(width, ".")[:width]
+    seqs, seen = {}, set()
+    for _, row in sub.iterrows():
+        label = str(row["seq_id"])
+        seq = str(row.get(seq_column) or "")
+        if not seq.strip() or label in seen:
+            continue
+        seen.add(label)
+        seqs[label] = seq
+    if not seqs:
+        return None, sub
 
-    spans = region_spans(sub.iloc[0], seqs[0]) if show_regions else []
+    try:
+        m = _msa.build(ref, seqs, ref_label="germline", ref_source=ref_source,
+                       backend=backend)
+    except (FileNotFoundError, subprocess.CalledProcessError, KeyError):
+        m = _msa.build(ref, seqs, ref_label="germline", ref_source=ref_source,
+                       backend="reference")
+    ordered = sub.set_index("seq_id").loc[m.labels].reset_index()
+    return m, ordered
 
-    n = len(seqs)
-    fig_w = min(24, max(8, width * 0.115))
-    band_h = 0.9 if spans else 0.0
-    fig, ax = plt.subplots(figsize=(fig_w, 0.26 * (n + 2) + 1.5 + band_h * 0.25), dpi=150)
-    show_letters = width <= 260
 
-    for r, (seq, label) in enumerate([(ref, ref_label)] + list(zip(seqs, labels))):
+def draw_msa(ax, m, source_rows=None, *, highlight_only_differences=True,
+             show_regions=True, show_letters=None, label_size=7,
+             letter_size=5.5, row_labels=True, number_step=None):
+    """Draw an Msa: germline on top and numbered, variants below, unnumbered.
+
+    The numbering belongs to the reference and only to the reference. An
+    inserted column is not a germline position, so it gets no number -- and a
+    variant's own residues are never numbered, because numbering them would
+    assert a position the germline does not define.
+
+    Colour means one thing and one thing only: *this differs from the
+    germline*. So the germline row itself is never filled -- it is grey letters
+    on white, the baseline the eye reads everything else against. A filled cell
+    below it is a substitution, or an insertion the germline has no residue
+    for, which is why an inserted residue is coloured even though there is
+    nothing above it to differ from.
+    """
+    width, n = m.width, m.n_sequences
+    if show_letters is None:
+        show_letters = width <= 300
+
+    rows_to_draw = [(m.ref_label, m.ref)] + list(zip(m.labels, m.rows))
+    for r, (label, seq) in enumerate(rows_to_draw):
         y = n - r
+        reference_row = r == 0
         for c, aa in enumerate(seq):
-            differs = r == 0 or aa != ref[c]
             if aa in ".-":
-                if r == 0:
-                    ax.add_patch(plt.Rectangle((c, y), 1, 1, facecolor=GAP_COLOR,
-                                               edgecolor="white", linewidth=0.25))
+                # A gap on the reference row is an insertion column: no
+                # germline residue exists there, so tint it like the rest of
+                # the column rather than marking the germline as divergent.
+                ax.add_patch(plt.Rectangle((c, y), 1, 1, facecolor=GAP_COLOR,
+                                           edgecolor="white", linewidth=0.25))
+                if show_letters:
+                    ax.text(c + 0.5, y + 0.5, "-", ha="center", va="center",
+                            fontsize=letter_size, color=GAP_INK)
                 continue
-            if differs or not highlight_only_differences:
+            differs = (not reference_row) and aa != m.ref[c]
+            if differs or (not highlight_only_differences and not reference_row):
                 color = AA_COLOR.get(aa, UNKNOWN_COLOR)
                 ax.add_patch(plt.Rectangle((c, y), 1, 1, facecolor=color,
                                            edgecolor="white", linewidth=0.25))
                 ink = _text_on(color)
             else:
-                ink = "#9c9a92"          # matches germline: present, recessive
+                ink = REF_INK if reference_row else MATCH_INK
             if show_letters:
                 ax.text(c + 0.5, y + 0.5, aa, ha="center", va="center",
-                        fontsize=5.5, color=ink)
-        ax.text(-1.5, y + 0.5, label[:22], ha="right", va="center",
-                fontsize=7, color=INK if r == 0 else MUTED,
-                fontweight="bold" if r == 0 else "normal")
+                        fontsize=letter_size, color=ink,
+                        fontweight="bold" if reference_row else "normal")
+        if row_labels:
+            ax.text(-1.5, y + 0.5, str(label)[:22], ha="right", va="center",
+                    fontsize=label_size, color=INK if r == 0 else MUTED,
+                    fontweight="bold" if r == 0 else "normal")
 
     top = n + 1
+    spans = []
+    if show_regions and source_rows is not None and len(source_rows):
+        spans = region_spans(source_rows.iloc[0], m.rows[0])
     for name, start, end in spans:
         is_cdr = name.startswith("CDR")
         ax.add_patch(plt.Rectangle((start, top + 0.15), end - start, 0.62,
                                    facecolor=REGION_BAND[is_cdr],
                                    edgecolor="white", linewidth=0.6))
         ax.text((start + end) / 2, top + 0.46, name, ha="center", va="center",
-                fontsize=7, color="#4a4a46",
+                fontsize=label_size, color="#4a4a46",
                 fontweight="bold" if is_cdr else "normal")
 
     ax.set_xlim(-0.5, width + 0.5)
-    ax.set_ylim(-0.4, top + 1.1)
-    ax.set_xticks(range(0, width, 10))
-    ax.set_xticklabels(range(0, width, 10), fontsize=7, color=MUTED)
-    ax.set_yticks([])
-    for side in ("top", "right", "left"):
-        ax.spines[side].set_visible(False)
-    ax.spines["bottom"].set_color(GRID)
-    ax.tick_params(colors=MUTED, length=2)
-    mode = "differences highlighted vs" if highlight_only_differences else "full colour vs"
-    note = ""
-    if dropped:
-        note = (f"; {dropped} of {n_total} padded to fit" if allow_ragged
-                else f"; {dropped} of {n_total} excluded as not column-aligned")
-    ax.set_title(f"{gene} — {mode} {ref_label}; IMGT regions above{note}",
-                 color=INK, fontsize=11, loc="left", pad=10)
-    fig.tight_layout()
-    fig.savefig(out, facecolor="white")
-    plt.close(fig)
-    return Path(out)
+    ax.set_ylim(-0.4, top + (1.1 if spans else 0.2))
 
-
-def _alignment_from_numbering(sub, gene, out, highlight_only_differences=True,
-                              show_regions=True, min_occupancy=0.02):
-    """Render an alignment built from ANARCI IMGT numbering. None if unusable."""
-    from . import imgt
-
-    aln = imgt.build(sub, min_occupancy=min_occupancy)
-    if aln is None or aln.width == 0:
-        return None
-    columns = list(aln.matrix.columns)
-    ref_map, ref_rows = imgt.germline_row(sub, columns)
-    if ref_map:
-        ref_label = f"germline (n={ref_rows})"
-    else:
-        modal = aln.matrix.mode(axis=0, dropna=True)
-        ref_map = {c: modal[c].iloc[0] for c in columns
-                   if c in modal and not modal[c].isna().all()}
-        ref_label = "consensus (germline unmappable)"
-
-    n = aln.matrix.shape[0]
-    width = aln.width
-    fig_w = min(24, max(8, width * 0.115))
-    fig, ax = plt.subplots(figsize=(fig_w, 0.26 * (n + 2) + 1.6), dpi=150)
-    show_letters = width <= 260
-
-    rows_to_draw = [(ref_label, {c: ref_map.get(c) for c in columns})] + [
-        (str(idx), dict(zip(columns, row))) for idx, row in aln.matrix.iterrows()]
-
-    for r, (label, residues) in enumerate(rows_to_draw):
-        y = n - r
-        for c, col in enumerate(columns):
-            aa = residues.get(col)
-            if not isinstance(aa, str) or not aa.strip():
-                ax.add_patch(plt.Rectangle((c, y), 1, 1, facecolor=GAP_COLOR,
-                                           edgecolor="white", linewidth=0.25))
-                continue
-            differs = r == 0 or aa != ref_map.get(col)
-            if differs or not highlight_only_differences:
-                color = AA_COLOR.get(aa, UNKNOWN_COLOR)
-                ax.add_patch(plt.Rectangle((c, y), 1, 1, facecolor=color,
-                                           edgecolor="white", linewidth=0.25))
-                ink = _text_on(color)
-            else:
-                ink = "#9c9a92"
-            if show_letters:
-                ax.text(c + 0.5, y + 0.5, aa, ha="center", va="center",
-                        fontsize=5.5, color=ink)
-        ax.text(-1.5, y + 0.5, label[:22], ha="right", va="center",
-                fontsize=7, color=INK if r == 0 else MUTED,
-                fontweight="bold" if r == 0 else "normal")
-
-    top = n + 1
-    if show_regions:
-        for name, start, end in aln.regions:
-            is_cdr = name.startswith("CDR")
-            ax.add_patch(plt.Rectangle((start, top + 0.15), end - start, 0.62,
-                                       facecolor=REGION_BAND[is_cdr],
-                                       edgecolor="white", linewidth=0.6))
-            ax.text((start + end) / 2, top + 0.46, name, ha="center", va="center",
-                    fontsize=7, color="#4a4a46",
-                    fontweight="bold" if is_cdr else "normal")
-
-    ax.set_xlim(-0.5, width + 0.5)
-    ax.set_ylim(-0.4, top + 1.1)
-    ticks = list(range(0, width, 10))
+    step = number_step or (10 if width <= 200 else 20)
+    ticks, tick_labels = [], []
+    for c, num in enumerate(m.numbers):
+        if num is not None and (num % step == 0 or num == 1):
+            ticks.append(c + 0.5)
+            tick_labels.append(str(num))
     ax.set_xticks(ticks)
-    ax.set_xticklabels([str(columns[t]).strip() for t in ticks],
-                       fontsize=7, color=MUTED)
+    ax.set_xticklabels(tick_labels, fontsize=label_size, color=MUTED)
     ax.set_yticks([])
     for side in ("top", "right", "left"):
         ax.spines[side].set_visible(False)
     ax.spines["bottom"].set_color(GRID)
     ax.tick_params(colors=MUTED, length=2)
-    mode = "differences highlighted vs" if highlight_only_differences else "full colour vs"
-    ax.set_title(f"{gene} — {mode} {ref_label}; IMGT numbered columns",
+    return m
+
+
+def alignment(rows: pd.DataFrame, gene: str, out: str | Path = "fig5_alignment.png",
+              max_rows: int = 50, highlight_only_differences: bool = True,
+              seq_column: str = "aa_gapped", germline_column: str = "germline_aa",
+              show_regions: bool = True, backend: str = "reference",
+              fasta_path=None, also_write_fasta: bool = True):
+    """Alignment figure for one V gene, germline at the top.
+
+    Every sequence calling this gene is aligned to the gene's germline with
+    gaps (see `library.msa`). The germline is the first row and carries the
+    numbering; nothing below it is numbered. With
+    `highlight_only_differences` only positions that depart from the germline
+    get a coloured fill, so divergence is what catches the eye.
+
+    Writes the alignment beside the figure as FASTA, so it can be opened in
+    Geneious, Jalview, or anything else, and so the picture is checkable.
+    """
+    m, source = build_msa(rows, gene, max_rows=max_rows, seq_column=seq_column,
+                          germline_column=germline_column, backend=backend,
+                          fasta_path=fasta_path)
+    out = Path(out)
+    if m is None:
+        fig, ax = plt.subplots(figsize=(9, 2.2), dpi=150)
+        ax.axis("off")
+        ax.text(0.02, 0.6, f"No alignment for {gene}.", fontsize=12, color=INK)
+        ax.text(0.02, 0.32, f"Needs a germline reference ({germline_column}) and "
+                            f"sequences in {seq_column}.", fontsize=9, color=MUTED)
+        fig.savefig(out, facecolor="white", bbox_inches="tight")
+        plt.close(fig)
+        return out
+
+    width, n = m.width, m.n_sequences
+    fig_w = min(26, max(8, width * 0.115))
+    fig, ax = plt.subplots(figsize=(fig_w, 0.26 * (n + 2) + 1.8), dpi=150)
+    draw_msa(ax, m, source, highlight_only_differences=highlight_only_differences,
+             show_regions=show_regions)
+    ax.set_xlabel("germline residue number — insertions are not germline positions",
+                  fontsize=8, color=MUTED)
+    mode = ("colour = differs from germline" if highlight_only_differences
+            else "every residue coloured")
+    ax.set_title(f"{gene} — {n} sequences vs germline [{m.ref_source}]; "
+                 f"{mode}; {m.backend}",
                  color=INK, fontsize=11, loc="left", pad=10)
     fig.tight_layout()
     fig.savefig(out, facecolor="white")
     plt.close(fig)
-    return Path(out)
+
+    if also_write_fasta:
+        out.with_suffix(".fasta").write_text(m.as_fasta())
+        out.with_suffix(".aln.txt").write_text(m.as_text())
+    return out
+
+
+def alignments_per_gene(rows: pd.DataFrame, out_dir: str | Path,
+                        genes: list[str] | None = None, *, max_rows: int = 50,
+                        prefix: str = "alignment", **kwargs) -> dict[str, Path]:
+    """One alignment per V gene present. This is the per-family deliverable."""
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if genes is None:
+        genes = list(rows["v_gene"].dropna().value_counts().index)
+    made = {}
+    for gene in genes:
+        if not len(rows[rows["v_gene"] == gene]):
+            continue
+        made[gene] = alignment(rows, gene, out_dir / f"{prefix}_{gene}.png",
+                               max_rows=max_rows, **kwargs)
+    return made
 
 
 def aa_legend(out: str | Path = "fig5b_aa_legend.png"):
@@ -513,3 +522,231 @@ def aa_legend(out: str | Path = "fig5b_aa_legend.png"):
     fig.savefig(out, facecolor="white")
     plt.close(fig)
     return Path(out)
+
+
+# --- one figure summarising the input data ---------------------------------
+
+def summary_panel(pool_df: pd.DataFrame, picked: pd.DataFrame,
+                  alignment_rows: pd.DataFrame | None = None,
+                  gene: str | None = None,
+                  out: str | Path = "input_summary.png",
+                  panel: germlines.Panel | None = None,
+                  max_alignment_rows: int = 50):
+    """Germline usage, CDRH3 lengths and an example alignment in one figure.
+
+    The alignment is drawn as a difference map against the germline, the same
+    way the per-family figures are, so one reading applies to every alignment
+    this repo produces: grey is germline, colour is departure from it.
+
+    50 sequences by default: enough to stand in for the list that will be
+    marched through the downstream steps, few enough that the rows are still
+    distinguishable at figure size.
+    """
+    from matplotlib import gridspec
+
+    panel = panel or germlines.DEFAULT
+    genes = [g for g in panel.genes if (pool_df["v_gene"] == g).any()]
+    gene = gene or (picked["v_gene"].value_counts().index[0] if len(picked) else genes[0])
+
+    have_aln = alignment_rows is not None and len(alignment_rows)
+    n_rows = max_alignment_rows
+    # Height scales with the alignment: 50 rows need room to stay legible, and
+    # a fixed figure height would either squash them or leave a field of white
+    # under a 10-row one.
+    aln_h = 0.20 * (n_rows + 3) if have_aln else 0
+    fig = plt.figure(figsize=(17, 3.4 + aln_h), dpi=150)
+    gs = gridspec.GridSpec(2 if have_aln else 1, 2,
+                           height_ratios=[3.0, aln_h] if have_aln else [1],
+                           hspace=0.18, wspace=0.16,
+                           left=0.05, right=0.985, top=0.93, bottom=0.05)
+
+    ax1 = fig.add_subplot(gs[0, 0])
+    pool_frac = [(pool_df["v_gene"] == g).mean() for g in genes]
+    pick_frac = [(picked["v_gene"] == g).mean() for g in genes]
+    x = range(len(genes))
+    for i, (vals, label, color) in enumerate([(pool_frac, "pool", SERIES[0]),
+                                              (pick_frac, "picked", SERIES[1])]):
+        pos = [p + (i - 0.5) * 0.36 for p in x]
+        bars = ax1.bar(pos, vals, width=0.34, color=color, label=label, zorder=3)
+        for b, v in zip(bars, vals):
+            ax1.text(b.get_x() + b.get_width() / 2, v + 0.012, f"{v:.0%}",
+                     ha="center", va="bottom", fontsize=8, color=MUTED)
+    ax1.set_xticks(list(x))
+    ax1.set_xticklabels(genes, color=INK, fontsize=9)
+    ax1.set_ylabel("fraction", color=MUTED, fontsize=9)
+    ax1.set_ylim(0, max(pool_frac + pick_frac) * 1.22)
+    ax1.set_title("Germline usage", color=INK, fontsize=11, loc="left", pad=22)
+    ax1.legend(frameon=False, fontsize=9, labelcolor=MUTED, ncol=2,
+               loc="lower left", bbox_to_anchor=(0, 1.0))
+    _style(ax1)
+
+    ax2 = fig.add_subplot(gs[0, 1])
+    for i, g in enumerate(genes):
+        sub = pool_df[pool_df["v_gene"] == g]["cdr3_len"]
+        parts = ax2.violinplot([sub], positions=[i], widths=0.7, showextrema=False)
+        for body in parts["bodies"]:
+            body.set_facecolor(SERIES[i % len(SERIES)])
+            body.set_alpha(0.30)
+        sel = picked[picked["v_gene"] == g]["cdr3_len"]
+        if len(sel):
+            ax2.scatter([i] * len(sel), sel, s=16, color=SERIES[i % len(SERIES)],
+                        edgecolor="white", linewidth=0.8, zorder=4)
+    ax2.set_xticks(range(len(genes)))
+    ax2.set_xticklabels(genes, color=INK, fontsize=9)
+    ax2.set_ylabel("CDRH3 length (aa)", color=MUTED, fontsize=9)
+    ax2.set_title("CDRH3 length — pool, picked marked", color=INK, fontsize=11,
+                  loc="left", pad=22)
+    _style(ax2)
+
+    if have_aln:
+        ax3 = fig.add_subplot(gs[1, :])
+        m, source = build_msa(alignment_rows, gene, max_rows=n_rows)
+        if m is None:
+            # Never hand back a panel of bare axes: say why it is empty.
+            ax3.text(0.5, 0.5,
+                     f"no germline reference for {gene}, so no alignment\n"
+                     "(needs germline_aa on these rows — see pool.schema_drift)",
+                     ha="center", va="center", fontsize=10, color=MUTED,
+                     transform=ax3.transAxes)
+            ax3.set_xticks([]); ax3.set_yticks([])
+            for side in ("top", "right", "left", "bottom"):
+                ax3.spines[side].set_visible(False)
+        else:
+            draw_msa(ax3, m, source, highlight_only_differences=True,
+                     show_letters=True, letter_size=4.2, label_size=6)
+            ax3.set_title(f"{gene} — {m.n_sequences} sequences vs germline "
+                          f"[{m.ref_source}]; colour = differs from germline",
+                          color=INK, fontsize=11, loc="left", pad=20)
+            ax3.set_xlabel("germline residue number — only the germline is numbered",
+                           fontsize=8, color=MUTED)
+
+    fig.savefig(out, facecolor="white", bbox_inches="tight")
+    plt.close(fig)
+    return Path(out)
+
+
+# --- what we record about each clone ---------------------------------------
+
+TABLE_COLUMNS = [
+    ("well", "Well", 5),
+    ("clone_id", "Clone ID", 14),
+    ("v_gene", "V gene", 9),
+    ("j_gene", "J gene", 7),
+    ("cdr3_aa", "CDRH3", 16),
+    ("insert_aa_length", "VH aa", 6),
+    ("order_length", "Order bp", 9),
+    ("order_gc", "GC", 6),
+    ("fusion_site_5p", "OH 5'", 6),
+    ("fusion_site_3p", "OH 3'", 6),
+    ("aa_length", "IgG aa", 7),
+    ("germline_source", "Germline src", 13),
+    ("synthesis_warnings", "Warnings", 10),
+]
+
+
+# Clone ids share a long prefix, so truncating from the front prints the same
+# string in every row. Their unique tail is what distinguishes them.
+KEEP_TAIL = {"clone_id", "seq_id"}
+
+
+def _shorten(value, width: int, keep_tail: bool = False) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return "—"
+    text = f"{value:.3f}" if isinstance(value, float) else str(value)
+    if len(text) <= width:
+        return text
+    return ("…" + text[-(width - 1):]) if keep_tail else text[:width - 1] + "…"
+
+
+def metadata_table(clones: pd.DataFrame, n: int = 10,
+                   out: str | Path = "fig6_metadata.png",
+                   columns: list | None = None, title: str | None = None):
+    """The clone metadata table as a figure: what is recorded, per clone.
+
+    A CSV with 38 columns is not something anyone reads. This is the same data
+    with the long fields truncated, so the *shape* of the record is visible at
+    a glance -- which is the question people actually have when they ask what
+    the pipeline tracks.
+    """
+    columns = columns or [c for c in TABLE_COLUMNS if c[0] in clones.columns]
+    rows = clones.head(n)
+    n_cols, n_rows = len(columns), len(rows)
+
+    widths = [max(len(label), width) for _, label, width in columns]
+    total = sum(widths)
+    fig_w = min(22, max(9, total * 0.115))
+    fig, ax = plt.subplots(figsize=(fig_w, 0.32 * (n_rows + 3)), dpi=150)
+    ax.axis("off")
+    ax.set_xlim(0, total)
+    ax.set_ylim(-1.2, n_rows + 1.4)
+
+    edges, at = [], 0
+    for w in widths:
+        edges.append(at)
+        at += w
+
+    for c, ((_, label, _), x, w) in enumerate(zip(columns, edges, widths)):
+        ax.add_patch(plt.Rectangle((x, n_rows), w, 1.0, facecolor="#eceae3",
+                                   edgecolor="white", linewidth=1.2))
+        ax.text(x + 0.4, n_rows + 0.5, label, ha="left", va="center",
+                fontsize=8, color=INK, fontweight="bold")
+
+    for r in range(n_rows):
+        y = n_rows - 1 - r
+        if r % 2 == 0:
+            ax.add_patch(plt.Rectangle((0, y), total, 1.0, facecolor="#faf9f6",
+                                       edgecolor="none"))
+        row = rows.iloc[r]
+        for (key, _, width), x in zip(columns, edges):
+            ax.text(x + 0.4, y + 0.5,
+                    _shorten(row.get(key), width, key in KEEP_TAIL),
+                    ha="left", va="center", fontsize=7.2, color=MUTED,
+                    family="DejaVu Sans Mono")
+
+    ax.plot([0, total], [n_rows, n_rows], color=GRID, linewidth=0.8)
+    ax.plot([0, total], [0, 0], color=GRID, linewidth=0.8)
+    ax.set_title(title or f"Clone metadata — first {n_rows} of {len(clones)} wells "
+                          f"({len(clones.columns)} columns recorded per clone)",
+                 color=INK, fontsize=11, loc="left", pad=12)
+    ax.text(0, -0.9, "Long fields truncated for display; clones.csv holds the "
+                     "full values.", fontsize=7.5, color=MUTED, ha="left")
+    fig.tight_layout()
+    fig.savefig(out, facecolor="white", bbox_inches="tight")
+    plt.close(fig)
+    return Path(out)
+
+
+def stamp(out_dir: str | Path, run_id: str = "", note: str = "") -> Path:
+    """Record which run wrote the figures in this directory.
+
+    "Did my figures update?" is otherwise unanswerable by looking at them, and
+    a figure whose output path moved between versions sits there forever
+    looking current. This makes the answer one `cat` away.
+    """
+    from datetime import datetime, timezone
+    from ..core import version
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / "FIGURES_FROM.txt"
+    lines = [
+        f"written   {datetime.now(timezone.utc).isoformat(timespec='seconds')}",
+        f"code      {version.code_version()}",
+        f"run       {run_id or '(not recorded)'}",
+    ]
+    if note:
+        lines.append(f"note      {note}")
+    lines.append("")
+    lines.append("Any PNG in this directory older than the timestamp above was")
+    lines.append("left behind by an earlier version and is NOT current.")
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
+def stale(out_dir: str | Path, made: list) -> list[Path]:
+    """PNGs in this directory that the current run did not write."""
+    out_dir = Path(out_dir)
+    if not out_dir.exists():
+        return []
+    fresh = {Path(p).resolve() for p in made}
+    return sorted(p for p in out_dir.glob("*.png") if p.resolve() not in fresh)
