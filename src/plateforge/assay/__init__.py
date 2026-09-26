@@ -5,6 +5,8 @@ registry entries. See decisions/0019.
 """
 from __future__ import annotations
 
-from . import assign, elisa, plates, protocol, readers, steps   # noqa: F401
+from . import (assign, elisa, figures, hits, plates,   # noqa: F401
+               protocol, readers, steps)
 
-__all__ = ["assign", "elisa", "plates", "protocol", "readers", "steps"]
+__all__ = ["assign", "elisa", "figures", "hits", "plates", "protocol",
+           "readers", "steps"]

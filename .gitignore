@@ -17,3 +17,5 @@ outputs/
 # The data tree: pools, stores, run bundles. Big, regenerable, not ours to
 # version. Override the location with PLATEFORGE_DATA.
 /plateforge-data/
+
+/src/external/

@@ -18,7 +18,6 @@ scripts/demo.py. The whole figures/ tree is gitignored.
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 
 
@@ -139,7 +138,23 @@ def main() -> None:
         print(f"\n{args.aligner} is not on PATH; using the built-in aligner")
         args.aligner = "reference"
 
-    picked = diversity.sample(idx, args.pick, seed=args.seed,
+    # The pool is cumulative across ingests, so it holds genes that earlier
+    # runs brought in. Sampling the whole index would draw from those too --
+    # and the manifest would then record a gene filter the selection visibly
+    # violates, which reads as a broken filter rather than as a wide pool.
+    # Restrict the selection to the same genes this run asked for, and say how
+    # much of the pool that leaves eligible.
+    eligible = idx
+    if filt.genes:
+        eligible = idx[idx["v_gene"].isin(filt.genes)]
+        if len(eligible) < len(idx):
+            print(f"\nthe pool is cumulative: {len(idx):,} sequences held, "
+                  f"{len(eligible):,} match this run's gene filter "
+                  f"({', '.join(filt.genes)}). Selecting from those.")
+        if eligible.empty:
+            sys.exit("no pooled sequences match the requested genes")
+
+    picked = diversity.sample(eligible, args.pick, seed=args.seed,
                               unique_cdr3=not args.allow_duplicate_cdr3)
     print("\n" + picked[["seq_id", "v_gene", "cdr3_aa", "cdr3_len"]].to_string(index=False))
     if len(picked) < args.pick:
@@ -180,7 +195,7 @@ def main() -> None:
                                             backend=args.aligner,
                                             fasta_path=args.imgt_fasta).values())
     bundle = selection.run(
-        lib_id=lib_id, pool_index=idx, picked=picked,
+        lib_id=lib_id, pool_index=eligible, picked=picked,
         alignment_rows=picked_rows, meta=meta,
         n_requested=args.pick, seed=args.seed,
         filter_spec=filt, funnel=funnel, diversity_report=report,

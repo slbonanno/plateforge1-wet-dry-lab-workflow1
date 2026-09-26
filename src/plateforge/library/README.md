@@ -26,6 +26,10 @@ Sequence acquisition and in-silico construct generation.
 | `vendors.py` | Order tables, one registered emitter per vendor, each declaring whether its layout has been verified against a real template |
 | `ordering.py` | Composes the four: molecule, vector, strategy, vendor |
 | `codon.py` | Reverse translation, GC balancing, BsaI and homopolymer removal |
+| `snapgene.py` | Reads SnapGene `.dna` maps — the real pcDNA3.1(+) backbone, with its features |
+| `abif.py` | Reads (and, for tests, writes) `.ab1` traces: bases, Phred scores, well, plate, run time |
+| `dna.py` | DNA alignment: a k-mer screen, then banded affine alignment. Local at both ends |
+| `sanger.py` | What is actually in each well — verdicts, swap detection, rerun resolution |
 
 Two entry points:
 
@@ -154,6 +158,49 @@ decisions/0013 for what real output forced.
 Vendor order forms are deliberately absent: those need a real template in
 `fixtures/` first (Q15), and Gibson/HiFi adapters need the destination vector
 (Q16).
+
+## Sequencing a plate and reading it back
+
+Decision 0025. Every format here is verified against a real file in
+`fixtures/` — three Azenta `.ab1` traces, the pcDNA3.1(+) map, and the three
+vendors' own order-form templates.
+
+```bash
+python scripts/sequencing.py order  --clones .../clones.csv --vendor genewiz --primer CMV_F
+python scripts/sequencing.py verify --clones .../clones.csv --traces ~/Downloads/seq/
+python scripts/sequencing.py inspect          # what the real fixtures contain
+```
+
+```python
+from plateforge.library import abif, sanger
+
+traces = abif.read_all(Path("seq").glob("*.ab1"))
+calls, reruns = sanger.verify(traces, expectations)
+sanger.usable_wells(calls)
+```
+
+**The trace knows where it came from.** An `.ab1` carries the well (`TUBE`),
+the plate barcode (`CTID`), the run start time (`RUND1`/`RUNT1`) and the
+vendor's own name, all written by the sequencer. So the well is never parsed
+out of a filename, and reruns are ordered by the instrument's timestamp rather
+than by file modification time — which downloading rewrites, usually backwards.
+
+**Verdicts, not pass/fail:** `exact`, `silent`, `missense`, `indel`,
+`frameshift`, `mixed`, `no_insert`, `wrong_clone`, `low_quality`,
+`unreadable`. Only `exact` and `silent` are usable.
+
+`wrong_clone` is the one built for deliberately: each read is screened against
+all 96 expected inserts, not just its own, so a plate swap is named rather
+than missed. It is screened on the **insert**, because every well shares the
+same vector flanks — a read from an unrelated construct still shares 302 exact
+12-mers with pcDNA3.1 through backbone alone.
+
+Rerun grouping is by the sample name the submitter typed, with a deliberately
+conservative marker list (`_RR`, `-rerun`, `_redo`, `run2`, `v2`, `(2)` — but
+never a bare `_2`, which is usually a plate). Nothing is deleted; the loser is
+superseded (rule 10), the later run is not assumed to be the better one, and
+anything ambiguous goes to a human. This is the weakest part of the module and
+a vendor manifest would close it (Q23).
 
 ## Germline references
 

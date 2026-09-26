@@ -64,7 +64,57 @@ elute_neutralise → magnet_transfer → quantify_bli → normalise`. `plan` has
 side effects; `record` takes what happened. A human step has the same shape as
 a robot step.
 
-## 4 — Worklists (`plateforge.emit`)
+## 4 — Sequencing the clones (`scripts/sequencing.py`)
+
+```bash
+python scripts/sequencing.py order  --clones .../clones.csv --vendor genewiz --primer CMV_F
+python scripts/sequencing.py verify --clones .../clones.csv --traces ~/Downloads/seq/
+python scripts/sequencing.py inspect
+```
+
+| Stage | Does | Code |
+|---|---|---|
+| order | fills a vendor's real order form; enforces its stated limits before upload | `emit.sequencing` |
+| read | `.ab1` traces: bases, Phred scores, and the well/plate/run-time the sequencer wrote | `library.abif` |
+| trim | Mott's algorithm, so 5' noise is not aligned as mutations | `library.abif.mott_trim` |
+| screen | each read against all 96 expected **inserts**, to catch a plate swap | `library.dna.screen` |
+| align | banded affine alignment, local at both ends | `library.dna.align_to` |
+| call | `exact` / `silent` / `missense` / `indel` / `frameshift` / `mixed` / `no_insert` / `wrong_clone` / `low_quality` | `library.sanger` |
+| reruns | grouped by sample name, ordered by the instrument's timestamp; superseded, never deleted | `library.sanger.resolve_reruns` |
+
+Every format here is verified against a real file (decision 0025): three
+Azenta `.ab1` traces, the pcDNA3.1(+) SnapGene map, and the three vendors'
+order-form templates. **Out:** `outputs/<RUN id>/` — `calls.csv`,
+`usable_wells.csv`, `reruns.csv`, and the filled order form.
+
+## 5 — Reads → hits (`plateforge.assay.hits`)
+
+```python
+from plateforge.assay import hits
+
+result = hits.call(paired, "ratio_and_z", blanks=empty_wells)
+result.verdict      # callable | degraded | uncallable
+result.reasons      # sentences, not codes
+result.hits
+```
+
+A hit is a well that beats **its own** control well. The caller is allowed to
+refuse, and refusing is right about 10% of the time (decision 0024): on a
+plate whose top decile is under 10× its background, no threshold works, and
+the honest output is "re-read this sooner" rather than a short confident
+list. Saturation is flagged, never refused on — measurement said that one the
+other way round from the obvious guess.
+
+```bash
+python scripts/call_hits.py --pairs 600 --seed 17
+```
+
+Re-measures every threshold and writes the tables plus two worked plates.
+**Out:** `outputs/<RUN id>/` — `callers.csv`, `by_verdict.csv`,
+`by_dynamic.csv`, `by_saturation.csv`, `per_plate.parquet`,
+`calls_callable.png`, `calls_uncallable.png`, `pair_*.png`.
+
+## 6 — Worklists (`plateforge.emit`)
 
 ```python
 from plateforge.emit import worklists
@@ -84,6 +134,9 @@ Nothing is verified but our own format. Which instrument this lab has lives in
 | Octet BLI | one quantitation export + its plate map → `fixtures/octet/` |
 | Vendor order forms | one upload template each → `fixtures/<vendor>/` |
 | Protocol numbers | real volumes, incubations, wash counts (Q19) |
+| Gen5 metadata | one real multi-sheet workbook → `fixtures/gen5/` (Q20) |
+| Hit thresholds | a plate with a known positive control (Q21) |
+| Rerun grouping | a vendor submission manifest → `fixtures/sanger/` (Q23) |
 
 ## Reading an unexplained directory
 

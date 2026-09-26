@@ -138,3 +138,56 @@ anchor is moved into the junction block, in order.
 That makes the invariant unconditional — every junction starts in the first
 CDR3 column and ends in the last — regardless of what the pairwise aligner
 did, and regardless of whether the read has its anchors at all.
+
+---
+
+## Addendum, 2026-09-25 — the second way a junction slides
+
+The fix above handles the anchor column being *occupied by the wrong
+residue*. It does not handle the anchor column being **empty while the
+junction sits in the insertion slot before it**, and that turned out to be
+the common case on real-shaped data.
+
+How it happens: when C104 is **substituted** rather than deleted, the residue
+count never changes. IMGT 104 takes the relaxed junction gap penalty — a seam
+takes the more permissive side — so deleting the germline C scores better
+than mismatching it. The aligner empties the anchor column and slides the
+whole junction one slot left. Nothing lands at the anchor for the original
+check to catch, so that row renders its entire junction as a block to the
+left of everyone else's, with a single residue stranded in the CDR3 columns.
+
+Measured over 150 synthetic reads across three V families, three rows did
+exactly this — which is what "a couple of sequences with the CDR3 off to one
+side" looks like in the summary figure.
+
+**The discriminator is the insertion slot before the anchor**, and it cleanly
+separates two failures that are otherwise identical:
+
+| `before[104]` | what happened | what to do |
+|---|---|---|
+| empty | the cysteine is gone; the aligner borrowed the junction's first residue to fill the column | give it back; the anchor holds nothing |
+| non-empty | the cysteine was substituted; the junction slid left | the run starts at 104, so its first residue goes in the anchor column and the rest is junction |
+
+### Checked against something the aligner never sees
+
+`cdr3_aa` is carried alongside every OAS row and is not an input to the
+alignment. Before: the rendered junction equalled `cdr3_aa` for 147 of 150
+rows, and 3 rows were visibly displaced. After: **150 of 150, and zero
+displaced.** The alignments also got narrower — IGHV3-23 132 → 125 columns,
+IGHV3-53 127 → 122 — because the spurious pre-anchor insertion columns are
+gone.
+
+### What is still ambiguous, deliberately
+
+When the anchor column holds a non-reference residue and there is **no**
+insertion before it, two different things look identical: the cysteine was
+deleted and the junction's first residue was borrowed, or the cysteine was
+substituted and the junction is already correctly placed. Nothing in the
+alignment distinguishes them.
+
+The choice is to give the residue back, which keeps every junction stacked at
+the cost of one row's junction string being a residue long. Over the same 150
+reads that is 1 row, against 3 visibly displaced under the alternative. A
+test pins the behaviour so that changing it is a decision rather than a
+side effect, and the query's own IMGT numbering would settle it properly if
+it were ever carried through to this point.

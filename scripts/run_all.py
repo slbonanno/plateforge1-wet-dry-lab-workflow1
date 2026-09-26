@@ -61,6 +61,9 @@ def main() -> None:
     stages.append(run("simulated ELISA",
                       ["scripts/simulate_elisa.py", "--pairs", str(args.pairs),
                        "--register", "2"]))
+    stages.append(run("hit calling",
+                      ["scripts/call_hits.py", "--pairs", str(args.pairs)]))
+    stages.append(run("sequencing fixtures", ["scripts/sequencing.py", "inspect"]))
     if args.full:
         stages.append(run("real OAS selection", [
             "scripts/fetch_oas.py", "--study", "Briney et al., 2019",

@@ -25,15 +25,19 @@ gets its own numbered decision record and is struck from this list.
 | Q19 | Protocol parameters: bead and buffer volumes, incubation times, wash counts | `assay.protocol` defaults | Each step now declares its placeholders in an `assumed` dict and takes them as arguments, so nothing is hardcoded. Still needs real numbers, and a campaign protocol JSON to carry them (rule 8) |
 | Q9 | Real OAS fixture | `library` ingest | Still none, and now overdue: real ingest works, so a few thousand rows should be committed as a fixture |
 | Q15 | Vendor order form layouts | ordering | IDT, GenScript, Genewiz each differ, and all three keep their upload templates behind a login. `vendors.idt_eblocks` is a believed-two-column guess that refuses to emit without `allow_unverified=True` and stamps a caveat file when it does. State and capture instructions: `docs/formats/vendors.md` |
-| Q16 | Vector and adapter sequences for routes other than the working one | construct design | Closed for `pcdna-scfv-vk-v1` + Golden Gate by 0016. Gibson arms are emitted from the declared vector context, which is only as good as that declaration; a real plasmid map would settle it |
+| Q16 | Vector and adapter sequences for routes other than the working one | construct design | Closed for `pcdna-scfv-vk-v1` + Golden Gate by 0016. Gibson arms are emitted from the declared vector context. A real plasmid map is now in hand — `fixtures/backbone/pcDNA3.1.dna`, read by `library.snapgene` (0025) — so what remains is building the dual-cassette construct on it |
 | Q14 | Short CDRH3s inflate pairwise identity | `library` diversity spec | Two 5-mers differing at one position are 0.8 identical. The spec's threshold is length-blind; a length floor is the current workaround |
 | Q13 | Non-additive schema migration | all modules | Additive column adds are handled (0011). Renames, type changes and drops are not, and will need a versioned migration when first required |
 | Q18 | Should the picks resemble panning output rather than naive repertoire? | `library` selection | The current 96 are drawn from an unsorted naive repertoire: near-germline, unclonal, CDRH3s that no selection has enriched. That is the right input for a plumbing test and the wrong one for a mock campaign |
+| Q21 | Real thresholds for hit calling | `assay.hits` defaults | Every number in `hits.DEFAULTS` is calibrated on simulated plates (0024). `min_signal = 0.2` is the weakest — it is the number people reach for, not one we measured. A plate with a known positive control replaces it; a plate read before and after over-development tests the saturation finding directly |
+| Q22 | Ranking within a plate once wells saturate | `assay` pick session | Calling works at the ceiling; ranking does not, and the pick session has to choose the top N. Dilution series, or a shorter development, or ranking on a second read — undecided until real plates say which is cheap |
+| Q23 | A vendor submission manifest | `library.sanger` rerun resolution | Reruns are grouped by the sample name the submitter typed, which is a heuristic with a conservative marker list (0025). A manifest tying sample names to wells — which every vendor produces and none of ours is captured — would make it exact instead |
+| Q24 | Primer placement in the vector | `library.sanger` coverage reporting | Reads are aligned by sequence and need no primer, but "will CMV_F reach the VH in clean sequence?" cannot be answered without knowing where it anneals. The backbone is now loaded with real coordinates (0025), so this is answerable whenever it earns its place |
 | Q11 | Paired-chain data | `library` scFv path | The mirror splits heavy and light into separate folders, so they are not paired. True paired units are a different layout and need their own adapter |
 
 ## Closed
 
-See numbered decision records 0001-0003, 0005-0023.
+See numbered decision records 0001-0003, 0005-0025.
 
 - **Q17** (is IMGT reachable) — closed by 0017: it is not, from here, and it
   no longer matters. The tables ship inside the `anarci` package.

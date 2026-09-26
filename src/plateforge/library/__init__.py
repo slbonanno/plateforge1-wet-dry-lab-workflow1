@@ -1,3 +1,5 @@
-from . import diversity, germlines, oas, pool, synth
+from . import (abif, diversity, dna, germlines, oas, pool, sanger, snapgene,
+               synth)
 
-__all__ = ["diversity", "germlines", "oas", "pool", "synth"]
+__all__ = ["abif", "diversity", "dna", "germlines", "oas", "pool", "sanger",
+           "snapgene", "synth"]

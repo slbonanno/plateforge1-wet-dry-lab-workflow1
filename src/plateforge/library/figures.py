@@ -13,13 +13,15 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import pandas as pd
 
+from ..core import style
 from . import diversity, germlines
 
-# Validated categorical palette (CVD-checked; see docs/formats/README.md).
-SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100"]
-INK = "#0b0b0b"
-MUTED = "#52514e"
-GRID = "#d8d7d2"
+# The shared visual language lives in core.style so that library and assay
+# cannot drift apart; these names are kept because the module is full of them.
+SERIES = style.SERIES
+INK = style.INK
+MUTED = style.MUTED
+GRID = style.GRID
 
 
 def _style(ax):

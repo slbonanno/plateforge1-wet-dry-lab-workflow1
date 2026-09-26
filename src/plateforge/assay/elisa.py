@@ -67,6 +67,7 @@ ASSUMED = {
     "expression_failure_rate": 0.05,   # wells with no usable IgG
     "pipetting_cv": 0.07,
     "edge_effect": 0.12,               # evaporation lifts the outer ring
+    "well_failure_rate": 0.02,         # a well that got no detection antibody
 }
 
 
@@ -160,6 +161,7 @@ def draw_clones(clone_ids: list[str], rng: random.Random, *,
 @dataclass
 class PlateConditions:
     """How this particular plate was run. Applies to the whole plate."""
+    well_failure_rate: float = ASSUMED["well_failure_rate"]
     tmb_minutes: float = ASSUMED["nominal_tmb_minutes"]
     coating: float = 1.0               # antigen density, relative to nominal
     wash_quality: float = 1.0          # 1.0 clean; lower leaves background
@@ -273,10 +275,35 @@ def optical_density(bound: float, conditions: PlateConditions) -> float:
     return conditions.blank_od + (conditions.ceiling_od - conditions.blank_od) * developed
 
 
+def blank_od(conditions: PlateConditions, well: str, rng: random.Random,
+             plate_format: int = 96) -> float:
+    """An empty well: buffer and substrate, no antibody.
+
+    Not zero, and not noiseless. These wells are the plate's own measured
+    background, which is more useful than any assumed blank -- see
+    `plate_features`.
+    """
+    value = conditions.blank_od * math.exp(rng.gauss(0, 0.12))
+    if conditions.edge_effect and wellmod.is_edge(well, plate_format):
+        value += conditions.edge_effect * rng.uniform(0.5, 1.0) * 0.4
+    return round(max(value + rng.gauss(0, 0.008), 0.0), 4)
+
+
 def well_od(behaviour: CloneBehaviour, well: str, on_target: bool,
             conditions: PlateConditions, rng: random.Random,
             plate_format: int = 96) -> float:
-    """One well's reading."""
+    """One well's reading.
+
+    A small fraction of wells simply fail -- a bubble, a missed dispense, no
+    detection antibody -- and read at background whatever is in them. This
+    matters far more than its rate suggests, because the failures are
+    INDEPENDENT between the two plates. A failed CONTROL well makes an
+    ordinary clone's ratio explode, which is where real false positives come
+    from; a failed TARGET well hides a genuine binder. Without it, a ratio
+    threshold is never wrong and every caller looks perfect.
+    """
+    if rng.random() < conditions.well_failure_rate:
+        return blank_od(conditions, well, rng, plate_format)
     if not behaviour.expressed:
         bound = 0.0
     else:
@@ -341,20 +368,6 @@ class PlatePair:
             part["scenario"] = self.scenario
             frames.append(part)
         return pd.concat(frames, ignore_index=True)
-
-
-def blank_od(conditions: PlateConditions, well: str, rng: random.Random,
-             plate_format: int = 96) -> float:
-    """An empty well: buffer and substrate, no antibody.
-
-    Not zero, and not noiseless. These wells are the plate's own measured
-    background, which is more useful than any assumed blank -- see
-    `plate_features`.
-    """
-    value = conditions.blank_od * math.exp(rng.gauss(0, 0.12))
-    if conditions.edge_effect and wellmod.is_edge(well, plate_format):
-        value += conditions.edge_effect * rng.uniform(0.5, 1.0) * 0.4
-    return round(max(value + rng.gauss(0, 0.008), 0.0), 4)
 
 
 def simulate_pair(clone_ids: list[str], *, seed: int = 0,

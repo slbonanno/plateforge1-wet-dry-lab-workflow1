@@ -2232,6 +2232,79 @@ def test_a_junction_containing_tryptophan_keeps_its_own_columns():
         assert len(runs) <= 1, "the junction must not be torn in two"
 
 
+def test_a_substituted_cysteine_does_not_shift_that_sequence_left():
+    """The second way in, and the one that survived the first fix.
+
+    When C104 is *substituted* rather than deleted, the residue count never
+    changes. IMGT 104 takes the relaxed junction gap penalty (a seam takes the
+    more permissive side), so deleting the germline C scores better than
+    mismatching it -- the aligner empties the anchor column and slides the
+    whole junction into the insertion slot before it. Nothing lands at the
+    anchor for an at-the-column check to catch, and that row renders its
+    junction one block to the left with a single residue left behind.
+    """
+    from plateforge.library import germline_db, msa
+
+    if not germline_db.anarci_available():
+        pytest.skip("anarci not installed")
+    v, j = germline_db.from_anarci("IGHV3-23"), germline_db.from_anarci("IGHJ4")
+    seq, numbers = msa._drop_cdr3(v.sequence + j.sequence,
+                                  msa._numbers_for(v) + msa._numbers_for(j))
+    msa._NUMBERING[seq] = numbers
+    cut = len([n for n in numbers if n is not None and n <= 104])
+    m = msa.build(seq, {
+        "normal": seq[:cut] + "ARGLREYWKIDY" + seq[cut:],
+        "cys_to_asp": seq[:cut - 1] + "D" + "ARGLREYWKIDY" + seq[cut:],
+        "cys_to_tyr": seq[:cut - 1] + "Y" + "ARQCINCGFCGGKDYYYGMDV" + seq[cut:],
+    })
+    starts, ends, width = _junction_bounds(m)
+    assert starts == {0}, "a substituted anchor must not shift the junction"
+    assert ends == {width - 1}
+
+    by_label = dict(zip(m.labels, m.rows))
+    _, a, b = [s for s in m.region_columns() if s[0] == "CDR3"][0]
+    # the substituted residue sits in the anchor column -- it is still 104 --
+    # and the junction is exactly what was inserted, not one residue longer
+    assert by_label["cys_to_asp"][a - 1] == "D"
+    assert by_label["cys_to_asp"][a:b].replace("-", "") == "ARGLREYWKIDY"
+    assert by_label["cys_to_tyr"][a - 1] == "Y"
+    assert by_label["cys_to_tyr"][a:b].replace("-", "") == "ARQCINCGFCGGKDYYYGMDV"
+
+
+def test_a_borrowed_anchor_residue_is_given_back_to_the_junction():
+    """The remaining ambiguity, pinned so a future change is deliberate.
+
+    When the anchor column holds a non-reference residue and there is *no*
+    insertion before it, two different things look identical: the cysteine was
+    deleted and the junction's first residue was borrowed to fill the column,
+    or the cysteine was substituted and the junction is already placed
+    correctly. Nothing in the alignment distinguishes them.
+
+    The choice here is to give the residue back -- which keeps the junctions
+    stacked, at the cost of a junction one residue long on a substituted row
+    that happened to align this way. Measured over 150 synthetic reads, that
+    is 1 row; the alternative mis-called 3 and displaced them visibly.
+    """
+    from plateforge.library import msa
+
+    at = list("AW")
+    before = ["", "RDY", ""]
+    msa.consolidate_junction(at, before, "CW", 0, 1)
+    assert at[0] == "-", "the borrowed residue is returned, not kept"
+    assert before[1] == "ARDY"
+
+
+def test_consolidation_moves_a_slid_junction_back_between_the_anchors():
+    from plateforge.library import msa
+
+    at = list("YW")                      # C104 substituted to Y
+    before = ["DARDY", "", ""]           # and the whole junction slid left
+    msa.consolidate_junction(at, before, "CW", 0, 1)
+    assert at[0] == "D", "the first residue of the run is still 104"
+    assert before[0] == ""
+    assert before[1] == "ARDYY"
+
+
 def test_consolidation_is_a_no_op_when_the_anchors_are_intact():
     from plateforge.library import msa
 

@@ -79,6 +79,53 @@ wells are wrong, not noisy (decision 0023). Pass the plate map, or the sample
 count. Without either the pipeline says the map was unknown rather than
 guessing.
 
+## Calling hits
+
+```python
+from plateforge.assay import hits
+
+result = hits.call(paired_frame, "ratio_and_z", blanks=empty_wells)
+result.verdict      # callable | degraded | uncallable
+result.reasons      # why, in sentences a lab member can act on
+result.hits         # the wells, if the verdict allows any
+```
+
+A hit is a well that beats **its own** control well, so anything affecting a
+clone equally on both plates cancels before a threshold is applied
+(decision 0024). Four callers are registered; adding a fifth is a decorator.
+
+**A caller is allowed to refuse.** `uncallable` is a normal outcome, not an
+error, and it rests on the plate's dynamic range — top decile over background
+— because that is what measurement said predicts whether calling works
+(F1 0.46 below 12×, 0.84 above 30×). Saturation is *flagged, never refused
+on*: the obvious design had it backwards, and more saturation went with
+better calls, because a well only reaches the ceiling when something bound.
+
+```bash
+python scripts/call_hits.py --pairs 600 --seed 17
+```
+
+Re-measures every threshold in `hits.DEFAULTS` and writes the tables and two
+worked example plates to a run bundle. Every number in decision 0024 comes
+out of that command.
+
+## Figures
+
+`figures.py` draws four things, all on the `core.style` palette so these and
+the `library` figures read as one system:
+
+| | |
+|---|---|
+| `elisa_pair` | target, control, and the difference on a diverging scale |
+| `hit_calls` | which wells were found, missed, invented — plus the threshold as a line |
+| `clone_journey` | one sample through every container it passed through |
+| `pipeline_map` | what the whole run did, on a log axis |
+
+Anything drawn from simulated data is stamped **SIMULATED** on its face, not
+only in its manifest. Empty wells are painted as empty rather than as weak
+samples, so a 12-sample plate does not look like a 96-sample plate that
+failed.
+
 ## Reproducing everything
 
 ```bash
@@ -96,6 +143,5 @@ Still planned:
 - plate layout and clone registration
 - reader adapters (registry) parsing exports into the `assay` store
 - control resolution (registry): mirrored plate, on-plate wells, shared reference
-- QC and hit calling (registry): fold-over-control, absolute cutoff, robust z
-- plots for review
-- pick sessions: prompt for N, rank, enforce diversity, emit a `PCK`
+- pick sessions: prompt for N, rank, enforce diversity, emit a `PCK` —
+  the next piece, and the one that consumes a `CallSet`

@@ -819,3 +819,268 @@ def test_the_report_names_what_still_needs_a_human(fresh):
     assert list(table.columns)[:4] == ["grid_index", "sheet", "plate_id",
                                        "plate_kind"]
     assert len(assign.unresolved(proposals)) >= 1
+
+
+# --- hit calling ------------------------------------------------------------
+
+def _pair(seed: int = 1, scenario: str = "nominal", **kw):
+    from plateforge.assay import elisa
+
+    return elisa.simulate_pair(CLONES, seed=seed, scenario=scenario, **kw)
+
+
+def test_every_caller_returns_one_row_per_well_and_a_verdict():
+    from plateforge.assay import hits
+
+    frame = _pair(seed=1).truth()
+    for name in hits.CALLERS:
+        result = hits.call(frame, name)
+        assert len(result.calls) == len(frame)
+        assert set(result.calls["well"]) == set(frame["well"])
+        assert result.verdict in (hits.CALLABLE, hits.DEGRADED, hits.UNCALLABLE)
+        assert result.calls["is_hit"].dtype == bool
+
+
+def test_a_caller_is_added_by_registering_not_by_editing():
+    """Rule 5. A new rule is one decorator and nothing existing moves."""
+    from plateforge.assay import hits
+
+    before = set(hits.CALLERS)
+
+    @hits.CALLERS.register("everything_is_a_hit", needs_blanks=False)
+    def _greedy(frame, blanks=None, **params):
+        score = frame[hits.TARGET]
+        return hits.CallSet("everything_is_a_hit",
+                            hits._skeleton(frame, score, score > -1, **params))
+
+    try:
+        result = hits.call(_pair().truth(), "everything_is_a_hit")
+        assert result.calls["is_hit"].all()
+        assert set(hits.CALLERS) - before == {"everything_is_a_hit"}
+    finally:
+        hits.CALLERS._items.pop("everything_is_a_hit", None)
+        hits.CALLERS._meta.pop("everything_is_a_hit", None)
+
+
+def test_a_flat_plate_is_refused_rather_than_called():
+    """The point of the verdict: no threshold is right on some plates."""
+    from plateforge.assay import hits
+
+    flat = pd.DataFrame({
+        "well": [f"A{c:02d}" for c in range(1, 13)],
+        "clone_id": [f"CLN-{i:03d}" for i in range(12)],
+        hits.TARGET: [0.06, 0.05, 0.07, 0.06, 0.05, 0.06,
+                      0.07, 0.05, 0.06, 0.06, 0.07, 0.05],
+        hits.CONTROL: [0.05] * 12,
+    })
+    verdict, reasons = hits.plate_health(flat)
+    assert verdict == hits.UNCALLABLE
+    assert "background" in " ".join(reasons)
+
+
+def test_saturation_is_flagged_but_never_refused_on():
+    """Measured the other way round from the obvious guess (decision 0024):
+    more saturation went with BETTER calls, because only real binders
+    saturate. What is lost is ranking, not calling."""
+    from plateforge.assay import hits
+
+    frame = _pair(seed=4, scenario="tmb_overdeveloped").truth()
+    verdict, reasons = hits.plate_health(frame)
+    assert verdict != hits.UNCALLABLE or "background" in " ".join(reasons)
+    result = hits.call(frame, "fixed_ratio")
+    burnt = result.calls[result.calls[hits.TARGET] >= hits.DEFAULTS["saturation_od"]]
+    if len(burnt):
+        assert (burnt["flag"] == "saturated").all()
+        assert "ceiling" in " ".join(result.reasons)
+
+
+def test_a_hit_has_to_clear_the_floor_as_well_as_the_ratio():
+    """Two wells at background can have a ratio of 5 by noise alone."""
+    from plateforge.assay import hits
+
+    frame = pd.DataFrame({
+        "well": ["A01", "A02"],
+        "clone_id": ["CLN-000", "CLN-001"],
+        hits.TARGET: [0.05, 2.4],
+        hits.CONTROL: [0.005, 0.24],
+    })
+    calls = hits.fixed_ratio(frame).calls.set_index("well")
+    assert not calls.loc["A01", "is_hit"]     # ratio 10x, but 0.05 OD
+    assert calls.loc["A02", "is_hit"]
+    assert calls.loc["A01", "flag"] == "below floor"
+
+
+def test_the_measured_floor_moves_with_the_plates_own_blanks():
+    from plateforge.assay import hits
+
+    frame = pd.DataFrame({
+        "well": ["A01"], "clone_id": ["CLN-000"],
+        hits.TARGET: [0.4], hits.CONTROL: [0.02],
+    })
+    clean = hits.ratio_over_blank(frame, pd.Series([0.02, 0.02, 0.03]))
+    dirty = hits.ratio_over_blank(frame, pd.Series([0.30, 0.31, 0.29]))
+    assert clean.params["measured_floor"] < dirty.params["measured_floor"]
+    assert clean.calls.loc[0, "is_hit"]
+    assert not dirty.calls.loc[0, "is_hit"]
+
+
+def test_robust_z_is_not_dragged_by_its_own_outliers():
+    """Mean and SD would let a plate full of hits call none of them."""
+    from plateforge.assay import hits
+
+    values = [0.05] * 80 + [3.0] * 16
+    frame = pd.DataFrame({
+        "well": [f"{r}{c:02d}" for c in range(1, 13) for r in "ABCDEFGH"],
+        "clone_id": CLONES,
+        hits.TARGET: values,
+        hits.CONTROL: [0.05] * 96,
+    })
+    called = hits.robust_z(frame).calls
+    assert int(called["is_hit"].sum()) == 16
+
+
+def test_requiring_both_rules_calls_no_more_than_either_alone():
+    from plateforge.assay import hits
+
+    frame = _pair(seed=7).truth()
+    both = hits.call(frame, "ratio_and_z").calls["is_hit"].sum()
+    for single in ("ratio_over_blank", "robust_z"):
+        assert both <= hits.call(frame, single).calls["is_hit"].sum()
+
+
+def test_scoring_counts_against_the_known_binders():
+    from plateforge.assay import hits
+
+    truth = _pair(seed=3).truth()
+    perfect = truth.assign(is_hit=truth["is_binder"]).drop(columns=["is_binder"])
+    score = hits.score_calls(perfect, truth)
+    assert score["fp"] == 0 and score["fn"] == 0
+    assert score["precision"] == 1.0 and score["recall"] == 1.0
+    assert score["tp"] + score["tn"] == len(truth)
+
+
+def test_refusing_a_plate_withholds_its_hits():
+    """`respect_verdict` is the difference between 'no answer' and a
+    confident wrong one."""
+    from plateforge.assay import elisa, hits
+
+    pairs = elisa.simulate_many(CLONES, 24, seed=5)
+    strict = hits.evaluate(pairs, callers=["fixed_ratio"], respect_verdict=True)
+    loose = hits.evaluate(pairs, callers=["fixed_ratio"], respect_verdict=False)
+    refused = strict[strict["verdict"] == hits.UNCALLABLE]
+    if len(refused):
+        assert refused["tp"].sum() == 0 and refused["fp"].sum() == 0
+        assert loose[loose["verdict"] == hits.UNCALLABLE]["fp"].sum() >= \
+            refused["fp"].sum()
+
+
+def test_evaluation_carries_the_scenario_and_the_fill_fraction():
+    from plateforge.assay import elisa, hits
+
+    pairs = elisa.simulate_many(CLONES, 12, seed=8)
+    scored = hits.evaluate(pairs, callers=["ratio_over_blank"])
+    assert {"scenario", "fill", "verdict", "f1"} <= set(scored.columns)
+    assert len(scored) == 12
+    assert scored["fill"].between(0, 1).all()
+
+    table = hits.summarise(scored)
+    assert table["plates"].sum() == 12
+
+
+def test_the_caller_list_says_which_need_empty_wells():
+    from plateforge.assay import hits
+
+    table = hits.available().set_index("caller")
+    assert bool(table.loc["ratio_over_blank", "uses_blank_wells"])
+    assert not bool(table.loc["robust_z", "uses_blank_wells"])
+
+
+# --- assay figures ----------------------------------------------------------
+
+def test_every_assay_figure_writes_a_png(fresh):
+    from plateforge.assay import figures, hits
+
+    pair = _pair(seed=2)
+    one = figures.elisa_pair(pair, fresh / "pair.png")
+    calls = hits.call(pair.truth(), "ratio_over_blank")
+    two = figures.hit_calls(pair, calls, fresh / "calls.png")
+    three = figures.pipeline_map(
+        [{"name": "OAS", "count": 616809, "unit": "seqs"},
+         {"name": "ordered", "count": 96, "unit": "clones", "note": "one plate"}],
+        fresh / "pipe.png")
+    four = figures.clone_journey(
+        [{"content_kind": "eluate", "well": "A01", "barcode": "PF-E",
+          "volume_ul": 100.0, "clone_id": "CLN-000"},
+         {"content_kind": "dna", "well": "A01", "barcode": "PF-D",
+          "volume_ul": 50.0, "clone_id": "CLN-000"}],
+        fresh / "journey.png")
+    for path in (one, two, three, four):
+        assert path.exists() and path.stat().st_size > 5000
+
+
+def test_figures_draw_from_one_palette(fresh):
+    """Two modules drawing means two palettes unless they share a source."""
+    from plateforge.assay import figures
+    from plateforge.core import style
+    from plateforge.library import figures as libfigures
+
+    assert libfigures.SERIES is style.SERIES
+    assert figures.CONTENT_COLOUR["dna"] in style.SEQUENTIAL
+
+
+def test_a_journey_colours_by_content_not_by_position():
+    """A beads plate looks like a beads plate wherever it appears."""
+    from plateforge.assay import figures
+
+    assert (figures.CONTENT_COLOUR["beads"]
+            != figures.CONTENT_COLOUR["supernatant"])
+    kinds = ["dna", "cells", "supernatant", "beads", "eluate"]
+    assert len({figures.CONTENT_COLOUR[k] for k in kinds}) == len(kinds)
+
+
+def test_a_simulated_figure_says_so_on_its_face(fresh, monkeypatch):
+    """CLAUDE.md: synthetic data presented as real is the worst thing this
+    repo can do. The stamp is on the figure, not only in the manifest."""
+    from matplotlib.figure import Figure
+
+    from plateforge.assay import figures, hits
+
+    seen: list[str] = []
+    original = Figure.savefig
+
+    def spy(self, *a, **kw):
+        seen.append(" ".join(t.get_text() for t in self.texts))
+        return original(self, *a, **kw)
+
+    monkeypatch.setattr(Figure, "savefig", spy)
+    pair = _pair(seed=2)
+    figures.elisa_pair(pair, fresh / "pair.png")
+    figures.hit_calls(pair, hits.call(pair.truth(), "fixed_ratio"),
+                      fresh / "calls.png")
+    assert len(seen) == 2
+    assert all("SIMULATED" in text for text in seen)
+
+
+def test_a_well_can_fail_on_one_plate_and_not_the_other():
+    """Where real false positives come from (decision 0024). A failure that
+    hit both plates equally would cancel in the ratio and teach nothing."""
+    from plateforge.assay import elisa
+
+    lopsided = 0
+    for seed in range(40):
+        truth = elisa.simulate_pair(CLONES, seed=seed, scenario="nominal").truth()
+        expressed = truth[truth["expressed"] & truth["is_binder"]]
+        # a real binder reading at background on exactly one of its two plates
+        lopsided += int(((expressed["od450_target"] < 0.12) ^
+                         (expressed["od450_control"] < 0.12)).sum())
+    assert lopsided > 0
+
+
+def test_the_simulator_can_produce_a_false_positive_at_all():
+    """A dataset where the rule cannot be wrong measures nothing."""
+    from plateforge.assay import elisa, hits
+
+    pairs = elisa.simulate_many(CLONES, 40, seed=5)
+    scored = hits.evaluate(pairs, callers=["fixed_ratio"], respect_verdict=False)
+    assert scored["fp"].sum() > 0
+    assert scored["precision"].mean() < 1.0

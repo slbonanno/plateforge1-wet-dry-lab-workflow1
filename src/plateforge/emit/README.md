@@ -26,9 +26,48 @@ worklists.emit(plan.transfer_frame, "tecan_evo", allow_unverified=True)
 ```
 
 Anything below `verified` needs `allow_unverified=True` and is written with a
-`.CAVEAT.txt` beside it naming the sources. Nothing is verified yet but our
-own format -- a test asserts that, so the day a fixture lands, that test is
+`.CAVEAT.txt` beside it naming the sources.
+
+Among the **instrument worklists**, nothing is verified but our own format --
+a test asserts that, so the day a real instrument file lands, that test is
 what changes.
+
+The **sequencing order forms** are the exception, and the first emitters in
+this repo that are genuinely verified: all three vendors' real templates are
+in `fixtures/sequencing/`, and the tests read them.
+
+## Sequencing order forms
+
+```python
+from plateforge.emit import sequencing
+
+sequencing.available()                              # and how each is known
+form = sequencing.order(clones, "genewiz", primer="CMV_F")
+form.write("out/")                                  # plus a .NOTES.txt
+```
+
+| form | vendor | wells | fill order |
+|---|---|---|---|
+| `genewiz` *(default)* | Azenta / GENEWIZ | `A01` | both, as two columns |
+| `elim` | ELIM Biopharmaceuticals | `A1` | row-major |
+| `ucberkeley` | UC Berkeley DNA Sequencing Facility | `A1` | column-major |
+| `generic` | none | `A01` | ours |
+
+Three vendors, three well spellings, two fill directions (decision 0025). A
+column-major plate pasted into a row-major form is a 96-well transposition
+that every later step preserves and nothing downstream can detect -- which is
+rule 3's whole reason for existing. Each emitter converts once, on the way out.
+
+Azenta's is the one that fails quietly: it gives `Well (H)` and `Well (V)` as
+two orderings of the same 96 positions, paired row by row, and the first
+version of the emitter had them the wrong way round. A test now reads their
+template and asserts our pairing equals theirs for all 95 rows.
+
+Each form's own stated limits are enforced *before* writing, not discovered at
+upload: Azenta's 500-sample ceiling, ELIM's 50-character names and controlled
+vocabularies, and Berkeley's requirement to leave at least one well empty --
+which is how that facility confirms plate orientation, so a full 96-sample
+plate is refused rather than submitted.
 
 ## Adding an instrument
 

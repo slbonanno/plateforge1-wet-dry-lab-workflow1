@@ -431,13 +431,53 @@ def consolidate_junction(at: list[str], before: list[str],
     tryptophan column from across the block. So it is fixed structurally
     instead: an anchor column holds its own residue or nothing, and everything
     between the anchors is junction, by definition rather than by inference.
+
+    There is a second way in, which the first version of this missed. When the
+    cysteine is *substituted* rather than deleted, the residue count does not
+    change, and because IMGT 104 takes the relaxed junction gap penalty (a
+    seam takes the more permissive side), deleting the germline C is cheaper
+    than mismatching it. The aligner therefore leaves the anchor column empty
+    and puts the whole junction in the insertion slot *before* it -- so
+    nothing lands at the anchor for the check above to catch, and that row's
+    entire junction renders one block to the left with a single residue left
+    behind in the CDR3 columns. Measured on 150 synthetic reads across three
+    V families, three rows did exactly this.
+
+    An insertion before an intact anchor is a genuine FR3 insertion and is
+    left alone. An insertion before an *empty* anchor is a junction that has
+    slid: its first residue is the substituted 104 and belongs in the anchor
+    column, and the rest is junction. Checked against `cdr3_aa`, which the
+    aligner never sees, this reconstructs the junction exactly.
     """
     seam = w_index
     gathered = []
-    if 0 <= c_index < len(at) and at[c_index] not in ("", GAP) \
-            and at[c_index] != ref[c_index]:
-        gathered.append(at[c_index])
-        at[c_index] = GAP
+    if 0 <= c_index < len(at) and c_index < len(before):
+        held = at[c_index] if at[c_index] not in ("", GAP) else ""
+        spilled = before[c_index]
+        if held != ref[c_index] and (spilled or held):
+            # Two different failures, and the insertion slot before the anchor
+            # is what tells them apart:
+            #
+            #   spilled == ""  the cysteine is GONE and the aligner borrowed
+            #                  the junction's first residue to fill the column.
+            #                  Give it back; the anchor holds nothing.
+            #   spilled != ""  the cysteine was SUBSTITUTED, so the residue
+            #                  count never changed. Because IMGT 104 takes the
+            #                  relaxed junction gap penalty, deleting the
+            #                  germline C beat mismatching it, and the whole
+            #                  junction slid into the slot before the anchor.
+            #                  In sequence order that run starts at 104, so
+            #                  its first residue belongs in the anchor column
+            #                  -- substituted, but still 104 -- and the rest
+            #                  is junction.
+            if spilled:
+                run = spilled + held
+                at[c_index] = run[0]
+                gathered.append(run[1:])
+                before[c_index] = ""
+            else:
+                gathered.append(held)
+                at[c_index] = GAP
     gathered.append(before[seam])
     tail = ""
     if 0 <= w_index < len(at) and at[w_index] not in ("", GAP) \

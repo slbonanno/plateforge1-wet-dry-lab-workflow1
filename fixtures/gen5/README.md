@@ -24,3 +24,23 @@ a real target/control pair — straight out of Gen5, unmodified.
 
 With that, the preamble becomes parsed fields instead of strings, and
 `assay.assign` can match on barcode without being told the mapping.
+
+## Two more plates worth capturing, once hit calling is on real data
+
+Both are cheap if they happen during a run that was going to happen anyway.
+
+**A plate with a known positive control well.** Any well where you know an
+antibody binds the coated antigen. `hits.DEFAULTS["min_signal"] = 0.2` is the
+weakest number in the repo — it is the figure people reach for, not one we
+measured (Q21). One real positive, and its background, replaces it.
+
+**The same plate read twice: at the normal development time, and again after
+it has over-developed.** Decision 0024 found that saturation goes with
+*better* calls, not worse, because a well only reaches the ceiling when
+something really bound. That was measured on the simulator, whose optics are
+our own model, so it is currently a claim about our assumptions rather than
+about TMB. Two reads of one plate test it directly — and tell us whether a
+short second read is the cheap way to rank saturated wells (Q22).
+
+Note alongside: the two development times, and whether the reader was
+re-blanked between reads.

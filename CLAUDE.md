@@ -83,16 +83,28 @@ deliberately undecided.** Open questions belong there, not in code comments and
 not in someone's head. Read it when returning to the project after a gap. Do not
 resolve one silently — write the decision record.
 
-## README.md is author-maintained — do not edit it
+## README.md is part of the repo
 
-`README.md` belongs to the repository owner and is written by hand. Never edit
-it, and never include it in a patch. When a change alters what the project can
-do or how it is run, say so in the commit message and in the relevant module
-README under `src/plateforge/*/README.md`, which are fair game.
+`README.md` is maintained here and ships in patches like any other file. It
+was author-only until 2026-09-25; that rule is lifted.
+
+Two things about it are still the author's, not ours: the **voice** -- terse,
+note-style, acronyms fine, the italic asides -- and the **framing** of what
+the project is for. Match what is already on the page rather than rewriting it
+into house style.
+
+Its structure is Part 1, the workflow as an outline with no numbers in it,
+then Part 2, one run of that workflow with the data, the figures and a short
+summary per step. Keep new material on the correct side of that line: a
+capability goes in Part 1, a measurement goes in Part 2.
+
+Every figure it points at lives in `docs/figures/` and is produced by
+`scripts/readme_figures.py`. Never reference a figure that script cannot
+produce, and never let a simulated figure sit in a section that reads as real.
 
 ## Current state
 
-`core`, `library`, `assay` and `emit` are built and tested (311 tests).
+`core`, `library`, `assay` and `emit` are built and tested (386 tests).
 `reagents` is still a stub.
 
 `library` covers OAS ingest, the sequence pool, diversity-aware sampling,
@@ -141,10 +153,24 @@ A 96-well plate rarely holds 96 samples, and features computed over empty
 wells are wrong rather than noisy, so the plate map or the sample count has to
 be supplied.
 
+`assay.hits` calls hits on a paired frame and **is allowed to refuse**
+(decision 0024). Four callers in a registry; the verdict (`callable` /
+`degraded` / `uncallable`) rests on the plate's dynamic range, which
+measurement said predicts calling quality — and saturation is flagged, never
+refused on, because the obvious design had that backwards. Every threshold in
+`hits.DEFAULTS` is re-measurable with `scripts/call_hits.py`.
+
+`core.style` is the one palette for the whole repo, CVD-validated there, and
+both `library.figures` and `assay.figures` import it rather than keeping
+copies. Two rules those figures follow: a bar's length is linear even when
+the axis is log, and an empty well is painted as empty rather than as a weak
+sample.
+
 `scripts/run_all.py` reproduces every claim on the machine running it.
 
-The next piece of work is hit calling, then `reagents`, and closing Q15/Q7
-with real files — including a real Gen5 export.
+The next piece of work is the pick session (ranking a `CallSet` into a `PCK`),
+then `reagents`, and closing Q15/Q7 with real files — including a real Gen5
+export.
 
 Known-undecided areas are listed in `decisions/0004-open-questions.md`. Schemas
 in `core/schema/` are expected to gain columns; that is normal. What is expensive
